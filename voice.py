@@ -2314,43 +2314,54 @@ class VoiceRole(threading.Thread):
             else:
                 self.voice.press()
         elif b[0] == 0x00 and active:
-            now = time.time()
-            elapsed = now - getattr(self, "_press_time", 0.0)
-            # ★ 固件在 ~20 秒强行掐断（本机 A3 不送音频、只认 0E 续命，且老节奏把保活
-            #   卡在死线上）：这是"假结束"。只要距按下约 20 秒、且还没续录过，就自动
-            #   重开会话并继续按住 IME —— 多数情况下配合修正后的保活节奏能续住；即便
-            #   固件仍硬掐，这次重开也只再续 ~20 秒，下一轮 0x00 会走到正常释放，不会卡死。
-            #   用 18~23 秒这个窄窗口区分"固件掐断"和"用户真的松手"（用户极少恰好
-            #   在 20 秒整松手），避免把一次正常短按误判成掐断而卡住输入法。
-            premature = (getattr(self, "_voice_held", False)
-                         and not getattr(self, "_voice_reheld", False)
-                         and 18.0 <= elapsed <= 23.0)
-            if premature:
+            # ★ A3 的 ATVV 关闭帧是 `00 <reason>`（参考实现 chromecast_voice.py：HOLD 模式下
+            #   reason==2 = "用户物理松手"，reason==0/其它 = "设备自己结束/超时"）。这是区分
+            #   "真松手"和"固件 20 秒硬掐"的唯一可靠依据 —— 比之前用"距按下 18~23 秒"的
+            #   时间窗稳得多（那窗口 misses 了 15~18 秒的掐断，所以上次还是断）。
+            #
+            #   关键认知：输入法能否持续录音，取决于 **IME 热键是否被本地按着**，与 ATVV
+            #   会话是否活着无关 —— 会话只是"按下/松开"的信号。所以固件在 ~20 秒掐断
+            #   （reason≠2）时，我们**绝不松开 IME 热键**，只重开 ATVV 会话以便将来收到
+            #   "真松手"的 0x00；只有 reason==2、或"已被掐断后续录态又来一次关闭"才真正释放。
+            #   这样录音能跨过 20 秒死线连续进行，且最坏也只是 ~40 秒一段（固件硬卡时），不会卡死。
+            reason = b[1] if len(b) > 1 else 0
+            genuine_release = (reason == 2)
+            if genuine_release:
+                self._active = False
+                self._emit("key", {"id": "voice", "down": False})
+                self.voice.release()
+                self._voice_held = False
+                self._voice_reheld = False
+                n = self._session_frames
+                self._last_press_frames = n
+                # ★ 松开时显式关麦（对齐参考实现），下一段按下前状态是干净的。
+                self.atvv_cmd(self._mic_close_cmd())
+                self._log(f"语音：▲ 结束（松手，reason={reason}；本段 {n} 帧音频 ≈ {n / 62.5:.1f}s）")
+                if n < 20:
+                    self._log("语音：⚠ 音频帧太少 —— 遥控器没在送音频（多半没真正进录音态）")
+                elif self.sink is None:
+                    self._log("语音：⚠ 音频出口还没就绪，这段没送出去（看护任务正在重试）")
+            elif getattr(self, "_voice_reheld", False):
+                # 已续录态又来一次关闭 → 视为用户真松手，释放。最坏 ~40 秒一段，不卡死。
+                self._active = False
+                self._emit("key", {"id": "voice", "down": False})
+                self.voice.release()
+                self._voice_held = False
+                self._voice_reheld = False
+                n = self._session_frames
+                self._last_press_frames = n
+                self.atvv_cmd(self._mic_close_cmd())
+                self._log(f"语音：▲ 结束（续录态再遇关闭，reason={reason}；本段 {n} 帧）")
+            else:
+                # 固件自己掐断（reason≠2，疑似 20 秒超时）：用户还按着，IME 继续录音。
+                # 只重开 ATVV 会话等"真松手"的 0x00；IME 热键保持按下，**绝不松开**。
                 self._voice_reheld = True
-                self._press_time = now
                 try:
                     self.atvv_cmd(MIC_OPEN_CMD)
                 except Exception:
                     pass
-                self._log("语音：⚠ 会话约 20 秒被固件掐断（A3 固件不送音频、只认 0E 续命）"
-                          "—— 已自动重开并继续录音；若你已松开语音键，请再按一下让它彻底结束")
-                return
-            self._active = False
-            self._emit("key", {"id": "voice", "down": False})
-            self.voice.release()
-            self._voice_held = False
-            self._voice_reheld = False
-            n = self._session_frames
-            self._last_press_frames = n
-            # ★ 松开时显式关麦（同样对齐参考实现），下一段按下前状态是干净的。
-            self.atvv_cmd(self._mic_close_cmd())
-            self._log(f"语音：▲ 结束（本段 {n} 帧音频 ≈ {n / 62.5:.1f}s）")
-            if n < 20:
-                # 按键通了、但遥控器没送音频 —— 这是另一类问题（没真正进录音态），
-                # 跟「语音键读不到」完全不是一回事，日志里必须分开说。
-                self._log("语音：⚠ 音频帧太少 —— 遥控器没在送音频（多半没真正进录音态）")
-            elif self.sink is None:
-                self._log("语音：⚠ 音频出口还没就绪，这段没送出去（看护任务正在重试）")
+                self._log(f"语音：⚠ 会话被固件掐断（reason={reason}，疑似 20 秒超时）—— "
+                          f"IME 继续录音，已重开 ATVV 会话等待真正松手；原始帧 {b.hex()}")
         elif b[0] not in (0x00,):
             # 既不是"开始说话"(0x04) 也不是"结束"(0x00)：把原始字节打出来。
             # 遥控器换过固件/重新配对之后，通知里的操作码**有可能不一样** ——
