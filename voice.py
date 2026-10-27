@@ -1119,6 +1119,15 @@ class VoiceRole(threading.Thread):
                               f"—— 开始建语音连接")
                 return
             awake_since = None
+            # ★ 提示语要**立刻**切过来，不能等 60 秒的日志节流。否则刚重启 / 刚重配完
+            #   之后，界面会一直挂着"系统 HID 正在重建（遥控器刚换了电池 / 重新配对？）"，
+            #   明明链路已经握住了，看起来却像又坏了（2026-10-27 13:32 实测：
+            #   13:31:48 集合就打开了，13:32:05 界面还写着"正在重建"）。
+            if getattr(self, "_gate_note", "") != "wait":
+                self._gate_note = "wait"
+                self.note = i18n.L("等遥控器按键唤醒（按任意键）",
+                                   "Waiting for a remote button press")
+                self._emit("status", {"connected": False, "note": self.note})
             now = time.time()
             if now - self._gate_logged >= 60.0:
                 self._gate_logged = now
@@ -1129,9 +1138,6 @@ class VoiceRole(threading.Thread):
                 else:
                     self._log(f"语音：已等 {waited:.0f} 秒还没等到按键 —— "
                               f"按一下遥控器任意键即可")
-                self.note = i18n.L("等遥控器按键唤醒（按任意键）",
-                                   "Waiting for a remote button press")
-                self._emit("status", {"connected": False, "note": self.note})
             await asyncio.sleep(0.5)
             waited += 0.5
 
@@ -1633,6 +1639,7 @@ class VoiceRole(threading.Thread):
         self._unpaired_hinted = False      # 这次真连上了 → 下次再丢配对要能再提醒
         self._variant_hinted = False
         self._last_unpaired = False
+        self._gate_note = ""               # 已连上 → 下次再进守卫要能重新提示
         self.connected = True
         self.note = i18n.L("已连接", "Connected")
         self._emit("status", {"connected": True, "note": self.note})

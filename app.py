@@ -1743,11 +1743,17 @@ def _hid_state(keytap):
         return "reconnecting"
     if not getattr(keytap, "local_hid", False):
         return "absent"
-    if getattr(keytap, "ready", False):
-        if time.time() - getattr(keytap, "opened_at", 0.0) < HID_SETTLE_S:
-            return "reconnecting"
-        return "ok"
-    return "reconnecting"
+    # ★ 链路有没有被握住，看的是「集合打开了吗」（local_hid），不是「收到过按键
+    #   报文吗」（ready）。重开集合成功的那一刻 local_hid 就是 True，但 ready 要等
+    #   第一条 HID 报文才变 True —— 刚重启客户端、还没按键时它一定是 False。
+    #   原来这里直接 return "reconnecting"，于是界面一直挂着「系统 HID 正在重建
+    #   （遥控器刚换了电池 / 重新配对？）」，把人吓得以为又坏了（2026-10-27 13:30
+    #   实测：集合 13:30:31 就打开了，到 13:31:08 还报"正在重建"）。
+    if time.time() - getattr(keytap, "opened_at", 0.0) < HID_SETTLE_S:
+        return "reconnecting"
+    # 这里返回 ok 是安全的：ok 只允许在"20 秒内按过键"时建链，没按键一样什么都
+    # 不做，只是提示语从"正在重建"换成"按一下遥控器任意键"。
+    return "ok"
 
 
 def _wait_keytap_ready(keytap, timeout=3.0):
