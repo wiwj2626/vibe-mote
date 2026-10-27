@@ -444,6 +444,241 @@ class Player:
         self._holdmouse_stop()
 
 
+# ============================================================ 手势：单击 / 双击 / 长按
+# ★ 本地补丁（2026-10-27）：给一条映射加两个可选的「副作用」子映射。
+#
+#   "ok": {"type": "text", "text": "/clear", "enter": True,
+#          "double": {"type": "key", "value": "ESC"},
+#          "long":   {"type": "open", "value": "https://example.com"}}
+#
+#   顶层那条 = **单击**（保持原来的写法，老配置一个字都不用改）。
+#   double / long 各是一条普通映射，字段跟顶层完全一样（递归套娃也支持，
+#   但没人会这么干，所以只认一层）。
+#
+# 判定节奏照抄无线麦（RC003）那套 —— 那几个数字是真机调出来的手感，
+# 别凭感觉改：
+#   · 没配双击/长按 → **按下立刻触发**，跟原来一模一样，一毫秒延迟都没有
+#   · 配了长按     → 按住 550ms 触发长按，并**吞掉**这次单击
+#   · 配了双击     → 单击推迟 300ms 等第二击，超时才补发单击
+#   · 配了任一副作用 → repeat 连发失效（按住时间要用来判长按，两者没法共存）
+#   · 单击本身是 hold/holdcombo/holdmouse 的键 → 忽略副作用（"按住"就是它的语义），
+#     日志里提示一次，不静默失效
+GESTURE_DOUBLE_S = 0.30      # 双击窗口：两下之间最长间隔
+GESTURE_LONG_S = 0.55        # 按住超过这个时长算长按
+HOLD_TYPES = ("hold", "holdcombo", "holdmouse")
+
+
+class GestureRouter:
+    """把「遥控器按下/松开」翻译成 单击 / 双击 / 长按 三种触发。
+
+    比 Player 高一层：Player 只知道"执行这条映射"，这里负责"这条键到底该执行哪条"。
+    线程模型：`press`/`release` 在 HID 读线程上调用，两个定时器回调在各自线程上跑，
+    所以状态全在 `_lock` 里改；每个定时器带 `token`，取消后迟到的回调会自己认出
+    "我已经过期了"直接退出 —— 否则松手那一瞬间容易出现"单击和双击都触发"。
+    """
+
+    def __init__(self, player, log=None):
+        self.player = player
+        self._log = log or (lambda *_: None)
+        self._states = {}
+        self._warned = set()
+        self._lock = threading.RLock()
+
+    # ---------- 内部小工具 ----------
+    @staticmethod
+    def _has(m, key):
+        return isinstance(m.get(key), dict) and bool(m[key].get("type"))
+
+    def _secondary(self, kid, m):
+        """(has_double, has_long)。hold 类单击忽略副作用，并提示一次。"""
+        has_d = self._has(m, "double")
+        has_l = self._has(m, "long")
+        if (has_d or has_l) and str(m.get("type")) in HOLD_TYPES:
+            if kid not in self._warned:
+                self._warned.add(kid)
+                self._log(f"按键映射：{kid} 的单击是「按住」型，"
+                          f"双击/长按不生效（按住本身就是它的语义）")
+            return False, False
+        return has_d, has_l
+
+    def _fire(self, sub, kid=""):
+        """执行一条映射。repeat 在这里**一定**剥掉 —— 手势键的"按住"另有用途，
+        留着 repeat 会让单击在松手后开始无限连发（真踩过）。"""
+        if not isinstance(sub, dict) or not sub.get("type"):
+            return
+        one = dict(sub)
+        one.pop("repeat", None)
+        try:
+            self.player.down(one)
+            self.player.up(one)
+        except Exception as e:  # noqa: BLE001
+            self._log(f"按键映射：执行 {kid} 失败 {type(e).__name__}: {e}")
+
+    def _cancel(self, st, which):
+        t = st.get(which)
+        if t is not None:
+            st[which] = None
+            try:
+                t.cancel()
+            except Exception:
+                pass
+
+    def _drop(self, kid):
+        st = self._states.pop(kid, None)
+        if st is not None:
+            self._cancel(st, "double_timer")
+            self._cancel(st, "long_timer")
+            held = st.get("held_sub")
+            if held:                       # 长按是 hold 型：松手时要抬起来
+                try:
+                    self.player.up(held)
+                except Exception:
+                    pass
+        return st
+
+    def _arm_long(self, kid, st):
+        self._cancel(st, "long_timer")
+        token = object()
+        st["long_token"] = token
+
+        def fire():
+            with self._lock:
+                cur = self._states.get(kid)
+                if cur is not st or st.get("long_token") is not token:
+                    return                 # 已经取消 / 换了一轮
+                if not st.get("pressed"):
+                    return
+                st["long_fired"] = True
+                st["long_token"] = None
+                sub = st["long"]
+                st["held_sub"] = sub if str(sub.get("type")) in HOLD_TYPES else None
+            # 长按动作放到锁外面跑：open 可能要拉起浏览器，别卡住按键线程
+            if st["held_sub"]:
+                try:
+                    self.player.down(st["held_sub"])
+                except Exception:
+                    pass
+            else:
+                self._fire(sub, kid)
+
+        t = threading.Timer(GESTURE_LONG_S, fire)
+        t.daemon = True
+        st["long_timer"] = t
+        t.start()
+
+    def _arm_double(self, kid, st):
+        self._cancel(st, "double_timer")
+        token = object()
+        st["double_token"] = token
+
+        def fire():
+            with self._lock:
+                cur = self._states.get(kid)
+                if cur is not st or st.get("double_token") is not token:
+                    return
+                if st.get("pressed"):
+                    return
+                single = st["single"]
+                self._states.pop(kid, None)
+            self._fire(single, kid)        # 300ms 内没有第二下 → 补发单击
+
+        t = threading.Timer(GESTURE_DOUBLE_S, fire)
+        t.daemon = True
+        st["double_timer"] = t
+        t.start()
+
+    # ---------- 对外 ----------
+    def press(self, kid, m):
+        m = m or {}
+        if not m.get("type"):
+            return
+        has_d, has_l = self._secondary(kid, m)
+        immediate = None
+        with self._lock:
+            st = self._states.get(kid)
+            if st is not None and st.get("waiting_double"):
+                # 第二次按下：取消补发单击的定时器，这一轮算双击
+                self._cancel(st, "double_timer")
+                st["pressed"] = True
+                st["second"] = True
+                st["waiting_double"] = False
+                if has_l:
+                    self._arm_long(kid, st)
+                return
+            if st is not None and st.get("pressed"):
+                return                     # 重复 press（HID 层本该已过滤，双保险）
+            if st is not None:
+                self._drop(kid)
+            st = {"single": m, "pressed": True, "second": False,
+                  "waiting_double": False, "long_fired": False,
+                  "immediate": has_l is False and has_d is False,
+                  "long": m.get("long") or None, "double": m.get("double") or None,
+                  "long_timer": None, "double_timer": None,
+                  "long_token": None, "double_token": None, "held_sub": None}
+            self._states[kid] = st
+            if has_l:
+                self._arm_long(kid, st)    # 等 550ms 判长按
+            elif not has_d:
+                immediate = m              # 没有副作用：立刻走，零延迟
+            # has_d 且有 long 的情况已经在 arm_long 里等着了
+
+        if immediate is not None:
+            try:
+                self.player.down(immediate)
+            except Exception as e:  # noqa: BLE001
+                self._log(f"按键映射：执行 {kid} 失败 {type(e).__name__}: {e}")
+
+    def release(self, kid):
+        fire_single = None
+        fire_double = None
+        resume = None
+        with self._lock:
+            st = self._states.get(kid)
+            if st is None or not st.get("pressed"):
+                return
+            st["pressed"] = False
+            self._cancel(st, "long_timer")
+            if st.get("immediate"):
+                # 无副作用的键：按下时已经触发过，这里只负责"松开"
+                # （hold 类要把键抬起来；一次性动作 up() 是空实现，调了也无害）
+                resume = st["single"]
+                self._states.pop(kid, None)
+            elif st.get("long_fired"):
+                held = st.get("held_sub")
+                st["held_sub"] = None
+                self._states.pop(kid, None)
+                if held:                    # 长按是按住型：现在抬起
+                    try:
+                        self.player.up(held)
+                    except Exception:
+                        pass
+                return
+            elif st.get("second"):
+                fire_double = st["double"]  # 第二次松手 → 双击
+                self._states.pop(kid, None)
+            elif st.get("double"):
+                st["waiting_double"] = True
+                self._arm_double(kid, st)   # 等 300ms 看有没有第二下
+            else:
+                fire_single = st["single"]  # 只配了长按：短按=单击，松手时补发
+                self._states.pop(kid, None)
+
+        if resume is not None:
+            try:
+                self.player.up(resume)
+            except Exception:
+                pass
+        elif fire_double is not None:
+            self._fire(fire_double, kid)
+        elif fire_single is not None:
+            self._fire(fire_single, kid)
+
+    def reset(self):
+        with self._lock:
+            for kid in list(self._states):
+                self._drop(kid)
+
+
 # ============================================================ Frida 旁路
 BTHLE_ENUM = r"SYSTEM\CurrentControlSet\Enum\BTHLEDevice"
 HID_SVC_PREFIX = "{00001812-0000-1000-8000-00805f9b34fb}"
@@ -598,6 +833,9 @@ class KeyTap(threading.Thread):
         self.on_activity = None
         self.vidpid = vidpid
         self.player = Player()
+        # ★ 本地补丁：手势层（单击/双击/长按）。放在 Player 之上，
+        #   负责"这个键这一下该执行哪条映射"，Player 只管执行。
+        self.gest = GestureRouter(self.player, self._log)
         self.mapping = {}
         self.blocked_usages = []
         self.stop_flag = threading.Event()
@@ -619,6 +857,12 @@ class KeyTap(threading.Thread):
     def set_mapping(self, mapping):
         with self._lock:
             self.mapping = dict(mapping or {})
+        # ★ 本地补丁：换映射时把挂着的单击/双击/长按状态清掉，避免旧动作在改配置
+        #   之后才补发出来（用户看到的会是"改了没用，还按老动作跑了一下"）。
+        try:
+            self.gest.reset()
+        except Exception:
+            pass
         self._push_block()
 
     def _push_block(self):
@@ -1031,7 +1275,7 @@ class KeyTap(threading.Thread):
         m = self.mapping.get(kid)
         if m:
             try:
-                self.player.down(m)
+                self.gest.press(kid, m)     # ★ 手势层：单击/双击/长按分流
             except Exception as e:
                 self._log(f"按键映射：执行 {kid} 失败 {type(e).__name__}: {e}")
 
@@ -1041,15 +1285,17 @@ class KeyTap(threading.Thread):
         if not kid:
             return
         self._emit("key", {"id": kid, "down": False})
-        m = self.mapping.get(kid)
-        if m:
-            try:
-                self.player.up(m)
-            except Exception:
-                pass
+        try:
+            self.gest.release(kid)          # ★ 手势层自己记得按下时用的是哪条映射
+        except Exception:
+            pass
 
     def stop(self):
         self.stop_flag.set()
+        try:
+            self.gest.reset()               # ★ 先清手势定时器，免得停止后还补发一次
+        except Exception:
+            pass
         self.player.release_all()
         try:
             if self._script:

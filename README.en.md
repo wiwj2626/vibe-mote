@@ -10,16 +10,33 @@
 > On this machine the upstream build had **no button response at all**. Details in
 > **[`PATCHES.en.md`](PATCHES.en.md)** (Chinese: [`补丁说明.md`](补丁说明.md)).
 >
-> **4 files** changed, every hunk marked `★ 本地补丁` (local patch) so it stays mergeable with upstream:
+> **5 files** changed (`+769 / −67`), every hunk marked `★ 本地补丁` (local patch) so it stays mergeable with upstream:
 >
 > | File | Change | Problem solved |
 > |---|---|---|
 > | `hidlocal.py` | **new** | frida's `NtDeviceIoControlFile` hook received **zero reports** on this machine, so we read the HID device directly (`SetupAPI` + `ReadFile`) — no elevation, no frida |
-> | `keys.py` | +229 lines | Upstream's table is `report ID 0x02` + usage `0x0042`; ours is `0x01` + `0x0003` — **no overlap at all** → per-report-ID tables |
+> | `keys.py` | +489 lines | Upstream's table is `report ID 0x02` + usage `0x0042`; ours is `0x01` + `0x0003` — **no overlap at all** → per-report-ID tables |
 > | `keys.py` | repeat | `hold` relies on keyboard-driver auto-repeat, which **is not** generated for synthesized `SendInput` keydowns → `repeat` flag + software repeat (0.35 s initial delay, then every 0.08 s) |
 > | `keys.py` | new `text` / `open` types | A button can type text (optionally auto-Enter) or open a URL/app |
-> | `app.py` | +44 lines | Web UI understands the new types, preserves `repeat`/`enter` on save, ships a recommended A3 keymap |
+> | `keys.py` | **gesture layer** | One key does **single / double / long-press**: `double` / `long` sub-mappings, 300 ms / 550 ms timing (ported from RC003) |
+> | `app.py` | +100 lines | Web UI understands the new types, **recursively** preserves `repeat`/`enter`/`double`/`long`, ships a recommended A3 keymap |
+> | `web/index.html` | +228 lines | Trigger tabs, "Press Enter after typing" switch, editable `open` type; `normMapping()` no longer drops fields |
 > | `tap.js` | +19 lines | It only matched reports starting with `0x02` and zeroed from offset 0 (wiping the report ID too); now accepts `0x01`/`0x02` and writes from offset 1 |
+>
+> **One key, three actions** (pick the Double / Long tab in the UI — no hand-written JSON needed):
+>
+> ```json
+> "ok": {
+>   "type": "key", "value": "ENTER",
+>   "double": {"type": "key",  "value": "ESC"},
+>   "long":   {"type": "text", "text": "/clear", "enter": true}
+> }
+> ```
+>
+> `enter: true` means **press Enter right after typing** (the "Press Enter after typing (send it)" switch).
+> Caveat: with a double click configured, the single click fires 300 ms late (it waits for the second
+> press), so **do not put a double click on the D-pad**; and configuring double/long disables `repeat`
+> auto-repeat (the press duration is now used for long-press detection).
 >
 > **Voice does not go through HID** — it uses ATVV (`ab5e0001~4`) + IMA ADPCM, which upstream already
 > gets right. But BLE is a **single link**: Windows' HID must grab the connection first and the voice

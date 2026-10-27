@@ -100,6 +100,10 @@ DEFAULT_CONFIG = {
     "keys": RECOMMENDED,
 }
 TYPES = ("key", "hold", "combo", "holdcombo", "mouse", "holdmouse", "text", "open")
+# ★ 本地补丁：一条映射除了"单击"，还能挂双击 / 长按两条子映射。
+#   子映射的字段跟顶层完全一样（于是 text 的 enter、open 的网址在长按里也能用）。
+GESTURE_KEYS = ("double", "long")
+GESTURE_LABELS = {"double": "双击", "long": "长按"}
 
 REMOTE_LABELS = {
     "power": "电源", "input": "输入源", "up": "上", "down": "下",
@@ -111,8 +115,8 @@ MOUSE_LABELS = {"wheel_up": "滚轮上", "wheel_down": "滚轮下",
                 "left": "鼠标左键", "right": "鼠标右键", "middle": "鼠标中键"}
 
 
-def describe_mapping(m):
-    """给日志用的人类可读写法。"""
+def _describe_one(m):
+    """单条映射（不含子映射）的人类可读写法。"""
     t, v = (m or {}).get("type"), (m or {}).get("value")
     if t == "mouse":
         return MOUSE_LABELS.get(v, str(v))
@@ -130,6 +134,19 @@ def describe_mapping(m):
     if m.get("repeat"):
         return name + "（按住·连发）"
     return name + ("（按住）" if t in ("hold", "holdcombo") else "")
+
+
+def describe_mapping(m):
+    """给日志 / 界面提示用的人类可读写法（含双击、长按两条子映射）。"""
+    base = _describe_one(m)
+    extra = []
+    for g in GESTURE_KEYS:
+        sub = (m or {}).get(g)
+        if isinstance(sub, dict) and sub.get("type"):
+            extra.append(f"{GESTURE_LABELS[g]}→{_describe_one(sub)}")
+    if extra:
+        base += " ／ " + "，".join(extra)
+    return base
 
 
 # ============================================================ 控制台编码
@@ -285,6 +302,33 @@ def load_config():
     return _merge_defaults({})
 
 
+def _clean_mapping(m, with_gestures=True):
+    """把界面上传回来的一条映射收敛成能存盘的形状（非法就返回 None）。
+
+    ★ 本地补丁：下面这三样都**必须**原样保住，少一个界面点一次保存就悄悄丢功能 ——
+      · text 的 enter（打完自动回车发送）
+      · repeat（按住连发）
+      · double / long（双击、长按两条子映射）
+    """
+    if not isinstance(m, dict) or m.get("type") not in TYPES:
+        return None
+    if not isinstance(m.get("value"), str):
+        return None
+    out = {"type": m["type"], "value": m["value"],
+           "mods": [str(x).upper() for x in (m.get("mods") or [])],
+           "text": str(m.get("text") or "")}
+    if m["type"] == "text" and m.get("enter"):
+        out["enter"] = True
+    if m.get("repeat"):
+        out["repeat"] = True
+    if with_gestures:
+        for g in GESTURE_KEYS:
+            sub = _clean_mapping(m.get(g), with_gestures=False)
+            if sub:
+                out[g] = sub
+    return out
+
+
 def save_config(cfg):
     clean = {"_comment": DEFAULT_CONFIG["_comment"]}
     # ⚠ 语言必须在这里保住：save_config 只保留白名单字段，界面保存配置时不会带上 lang，
@@ -308,27 +352,19 @@ def save_config(cfg):
     for k, m in (cfg.get("keys") or {}).items():
         if k.startswith("_") or not isinstance(m, dict):
             continue
-        if m.get("type") not in TYPES or not isinstance(m.get("value"), str):
+        clean_m = _clean_mapping(m)
+        if not clean_m:
             continue
         # 界面在「按键映射」页也能点「语音」键 —— 那份写法存成 keys.voice。
         # 语音键其实不走 HID、由语音通道单独处理，所以这里把它归一到顶层 voice，
         # 免得同一个设置有两个真相。
         if k == "voice":
-            if m.get("type") in ("hold", "holdcombo", "key", "combo"):
-                voice_alias = {"mode": "hold" if m["type"].startswith("hold") else "tap",
-                               "key": m["value"],
-                               "mods": [str(x).upper() for x in (m.get("mods") or [])]}
+            if clean_m["type"] in ("hold", "holdcombo", "key", "combo"):
+                voice_alias = {"mode": "hold" if clean_m["type"].startswith("hold") else "tap",
+                               "key": clean_m["value"],
+                               "mods": list(clean_m["mods"])}
             continue
-        keys_map[k] = {"type": m["type"], "value": m["value"],
-                       "mods": [str(x).upper() for x in (m.get("mods") or [])],
-                       "text": str(m.get("text") or "")}
-        # ★ 本地补丁：text 类型可以带一个 enter 标记 —— 打完文本顺手回车
-        #   （"发一段固定文本然后直接发送"）。不保留它的话，界面一保存就被抹掉。
-        if m["type"] == "text" and m.get("enter"):
-            keys_map[k]["enter"] = True
-        # ★ 本地补丁：repeat —— 按住连续触发（方向键要"一直走"）
-        if m.get("repeat"):
-            keys_map[k]["repeat"] = True
+        keys_map[k] = clean_m
     clean["keys"] = keys_map
     if voice_alias:
         clean["voice"] = voice_alias

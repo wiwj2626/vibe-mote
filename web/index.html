@@ -410,7 +410,7 @@ input[type=range]::-moz-range-thumb{width:14px;height:14px;border-radius:50%;bac
   display:flex;flex-direction:column;align-items:center;justify-content:center;gap:2px;
   min-height:52px;min-width:0;padding:7px 6px;border-radius:var(--radius);
   border:1px solid var(--gray-7);background:var(--key-bg);box-shadow:var(--key-edge);
-  color:var(--fg);font:inherit;cursor:pointer;text-align:center;
+  color:var(--fg);font:inherit;cursor:pointer;text-align:center;position:relative;
   transition:transform .08s var(--ease),background var(--dur) var(--ease),border-color var(--dur) var(--ease),box-shadow var(--dur) var(--ease);
 }
 .key:hover{border-color:var(--key-hover-border);background:var(--key-hover)}
@@ -419,6 +419,14 @@ input[type=range]::-moz-range-thumb{width:14px;height:14px;border-radius:50%;bac
 .key.unmapped{opacity:.58;border-style:dashed}
 .key.unmapped .key-map{color:var(--gray-9)}
 .key.selected{border-color:var(--accent);box-shadow:inset 0 0 0 1px var(--accent),0 0 0 3px rgba(77,107,254,.18)}
+/* ★ 本地补丁：这个键除了单击还配了双击/长按 —— 右上角点一下，省得点进去才知道 */
+.key.has-extra::after{content:"";position:absolute;top:5px;right:5px;width:5px;height:5px;border-radius:50%;background:var(--accent);opacity:.9}
+/* 触发方式分段选择（单击 / 双击 / 长按） */
+.seg{display:flex;border:1px solid var(--line);border-radius:var(--radius);overflow:hidden;background:var(--gray-2)}
+.seg button{flex:1 1 0;min-width:0;padding:6px 4px;font:inherit;font-size:12px;color:var(--muted);background:transparent;border:0;border-right:1px solid var(--line-soft);cursor:pointer;white-space:nowrap;transition:background var(--dur) var(--ease),color var(--dur) var(--ease)}
+.seg button:last-child{border-right:0}
+.seg button.active{background:var(--accent);color:var(--accent-fg);font-weight:600}
+.seg button.on{color:var(--accent-11)}
 .key.down{transform:scale(.94);background:var(--accent);border-color:var(--accent);color:var(--accent-fg);box-shadow:0 0 0 1px var(--accent),0 0 22px rgba(77,107,254,.42)}
 .key.pulse{animation:keypulse .5s ease}
 @keyframes keypulse{0%{box-shadow:0 0 0 0 rgba(76,141,255,.55)}100%{box-shadow:0 0 0 15px rgba(76,141,255,0)}}
@@ -660,6 +668,16 @@ input[type=range]::-moz-range-thumb{width:14px;height:14px;border-radius:50%;bac
 
             <div id="mappingForm" hidden>
               <div class="field">
+                <label data-i18n="map.gesture">触发方式</label>
+                <div class="seg" id="mapGesture">
+                  <button type="button" class="active" data-g="single" data-i18n="map.gestureSingle">单击</button>
+                  <button type="button" data-g="double" data-i18n="map.gestureDouble">双击</button>
+                  <button type="button" data-g="long" data-i18n="map.gestureLong">长按</button>
+                </div>
+                <div class="hint" id="mapGestureHint"></div>
+              </div>
+
+              <div class="field">
                 <label for="mapType" data-i18n="map.type">映射类型</label>
                 <select id="mapType">
                   <option value="key" data-i18n="map.optKey">key · 单键</option>
@@ -669,6 +687,7 @@ input[type=range]::-moz-range-thumb{width:14px;height:14px;border-radius:50%;bac
                   <option value="mouse" data-i18n="map.optMouse">mouse · 鼠标</option>
                   <option value="holdmouse" data-i18n="map.optHoldMouse">holdmouse · 按住鼠标</option>
                   <option value="text" data-i18n="map.optText">text · 文本</option>
+                  <option value="open" data-i18n="map.optOpen">open · 打开网址/程序</option>
                 </select>
               </div>
 
@@ -700,6 +719,15 @@ input[type=range]::-moz-range-thumb{width:14px;height:14px;border-radius:50%;bac
               <div class="field" id="fieldText">
                 <label for="mapText" data-i18n="map.text">文本内容</label>
                 <textarea id="mapText" data-i18n-placeholder="map.textPh" placeholder="按下遥控器键时输入的文本"></textarea>
+                <label class="switch" style="margin-top:9px">
+                  <input type="checkbox" id="mapEnter">
+                  <span data-i18n="map.autoEnter">打完自动按回车发送</span>
+                </label>
+              </div>
+
+              <div class="field" id="fieldOpen">
+                <label for="mapOpen" data-i18n="map.openTarget">要打开的内容</label>
+                <input type="text" id="mapOpen" data-i18n-placeholder="map.openPh" placeholder="https://… 或 C:\路径\程序.exe">
               </div>
 
               <div class="row" style="margin-top:16px">
@@ -1097,6 +1125,20 @@ input[type=range]::-moz-range-thumb{width:14px;height:14px;border-radius:50%;bac
       'map.optMouse': 'mouse · 鼠标',
       'map.optHoldMouse': 'holdmouse · 按住鼠标',
       'map.optText': 'text · 文本',
+      'map.optOpen': 'open · 打开网址/程序',
+      'map.gesture': '触发方式',
+      'map.gestureSingle': '单击',
+      'map.gestureDouble': '双击',
+      'map.gestureLong': '长按',
+      'map.hintDouble': '两次按键间隔小于 300ms 算双击。配了双击后，单击会晚 300ms 才触发（它在等第二下）。',
+      'map.hintLong': '按住超过 550ms 算长按，这一次的单击会被吃掉。',
+      'map.hintHoldConflict': '这个键的「单击」本身是按住型（hold），双击/长按不会生效 —— 按住时间被它占用了。要用长按，请先把单击改成 key/combo。',
+      'map.hintInherit': '这条是预设自带的，还没写进配置。改完点保存才会覆盖预设。',
+      'map.saveThis': '保存这一档',
+      'map.clearThis': '清除这一档',
+      'map.autoEnter': '打完自动按回车发送',
+      'map.openTarget': '要打开的内容',
+      'map.openPh': 'https://… 或 C:\\路径\\程序.exe',
       'map.target': '目标键',
       'map.capturePh': '点右侧按钮捕获',
       'map.capture': '按键捕获',
@@ -1115,6 +1157,7 @@ input[type=range]::-moz-range-thumb{width:14px;height:14px;border-radius:50%;bac
       'map.holdWheel': '按住 {0}·连续滚',
       'map.textEmpty': '文本（空）',
       'map.textPrefix': '文本：{0}',
+      'map.openPrefix': '打开 {0}',
       'map.hintVoice': '语音键也可以单独在「语音」页配置；这里保存会写入按键映射表（keys.voice）。',
       'map.hintSave': '保存会把完整配置（含其它按键）一起 POST 到 /api/config。',
       'mouse.wheelUp': '滚轮上',
@@ -1296,6 +1339,8 @@ input[type=range]::-moz-range-thumb{width:14px;height:14px;border-radius:50%;bac
       'toast.checkFail': '体检失败：后端未响应',
       'toast.pickKey': '请先捕获目标键',
       'toast.textEmptyWarn': '文本内容为空，将写入空文本映射',
+      'toast.openEmptyWarn': '请先填要打开的网址或程序路径',
+      'toast.needSingleFirst': '这个键还没有单击映射 —— 先配好「单击」，再配双击/长按',
       'toast.noSuchMap': '这个按键本来就没有映射',
       'toast.locateOn': '已开启：按遥控器键自动定位',
       'toast.locateOff': '已关闭自动定位',
@@ -1310,6 +1355,7 @@ input[type=range]::-moz-range-thumb{width:14px;height:14px;border-radius:50%;bac
       'toast.langEn': 'Switched to English',
       'confirm.recommended': '用推荐配置覆盖当前全部按键映射？',
       'confirm.clearAll': '清空全部按键映射？',
+      'confirm.clearSingle': '这个键还挂着双击/长按，清掉单击会连同它们一起删掉。继续？',
       'uninstall.confirmHead': '将删除以下 {0} 项：',
       'uninstall.confirmKeep': '没勾的都不会动。',
       'uninstall.confirmAdmin': '含需要管理员的项，会弹一次 UAC。',
@@ -1472,6 +1518,20 @@ input[type=range]::-moz-range-thumb{width:14px;height:14px;border-radius:50%;bac
       'map.optMouse': 'mouse · mouse',
       'map.optHoldMouse': 'holdmouse · hold mouse',
       'map.optText': 'text · text',
+      'map.optOpen': 'open · open URL / app',
+      'map.gesture': 'Trigger',
+      'map.gestureSingle': 'Single',
+      'map.gestureDouble': 'Double',
+      'map.gestureLong': 'Long',
+      'map.hintDouble': 'Two presses within 300ms count as a double click. With a double click configured, the single click fires 300ms late — it is waiting for the second press.',
+      'map.hintLong': 'Holding for more than 550ms counts as a long press; that single click is swallowed.',
+      'map.hintHoldConflict': 'This key\u2019s single action is a hold type, so double/long press cannot work — the hold owns the press duration. Change the single action to key/combo first.',
+      'map.hintInherit': 'This mapping comes from the preset and is not in your config yet. Save to make it yours.',
+      'map.saveThis': 'Save this trigger',
+      'map.clearThis': 'Clear this trigger',
+      'map.autoEnter': 'Press Enter after typing (send it)',
+      'map.openTarget': 'What to open',
+      'map.openPh': 'https://… or C:\\path\\app.exe',
       'map.target': 'Target key',
       'map.capturePh': 'Click the button on the right to capture',
       'map.capture': 'Capture key',
@@ -1490,6 +1550,7 @@ input[type=range]::-moz-range-thumb{width:14px;height:14px;border-radius:50%;bac
       'map.holdWheel': 'Hold {0} · repeats',
       'map.textEmpty': 'Text (empty)',
       'map.textPrefix': 'Text: {0}',
+      'map.openPrefix': 'Open {0}',
       'map.hintVoice': 'The voice key can also be configured on the Voice page; saving here writes it into the key map (keys.voice).',
       'map.hintSave': 'Saving POSTs the complete config (including the other keys) to /api/config.',
       'mouse.wheelUp': 'Wheel up',
@@ -1672,6 +1733,8 @@ input[type=range]::-moz-range-thumb{width:14px;height:14px;border-radius:50%;bac
       'toast.checkFail': 'Check failed: no response from the backend',
       'toast.pickKey': 'Capture a target key first',
       'toast.textEmptyWarn': 'The text is empty, so an empty text mapping will be saved',
+      'toast.openEmptyWarn': 'Enter the URL or program path to open',
+      'toast.needSingleFirst': 'This key has no single-click mapping — set that up before adding double/long press',
       'toast.noSuchMap': 'This key has no mapping anyway',
       'toast.locateOn': 'On: pressing a remote key locates it automatically',
       'toast.locateOff': 'Auto-locate off',
@@ -1686,6 +1749,7 @@ input[type=range]::-moz-range-thumb{width:14px;height:14px;border-radius:50%;bac
       'toast.langEn': 'Switched to English',
       'confirm.recommended': 'Overwrite all current key mappings with the recommended set?',
       'confirm.clearAll': 'Clear all key mappings?',
+      'confirm.clearSingle': 'This key also has a double/long press mapping. Clearing the single click deletes them too. Continue?',
       'uninstall.confirmHead': 'These {0} item(s) will be deleted:',
       'uninstall.confirmKeep': 'Anything not ticked is left untouched.',
       'uninstall.confirmAdmin': 'Some selected items need administrator rights; one UAC prompt will appear.',
@@ -1910,6 +1974,12 @@ input[type=range]::-moz-range-thumb{width:14px;height:14px;border-radius:50%;bac
   var config = null;         // /api/config（以服务端为准）
   var configLoaded = false;  // 未成功读到后端配置前，禁止保存
   var selectedKey = null;
+  // ★ 本地补丁：映射面板当前在编辑哪一档 —— single（单击）/ double / long。
+  //   面板本身只有一套表单，靠这个变量决定读写映射里的哪一层。
+  var currentGesture = 'single';
+  var GESTURES = ['double', 'long'];
+  // 面板上一次显示的映射类型：用来判断"是不是刚从别的类型切到 text"
+  var panelLastType = 'key';
   var locateMode = false;
   var logPaused = false;
   var signalTimer = null;
@@ -2316,6 +2386,11 @@ input[type=range]::-moz-range-thumb{width:14px;height:14px;border-radius:50%;bac
       case 'text':
         if (!m.text) return t('map.textEmpty');
         return t('map.textPrefix', m.text.length > 10 ? m.text.slice(0, 10) + '…' : m.text);
+      case 'open': {
+        // ★ 本地补丁：open 类型原来没有描述，按键上显示「未映射」，看着像没配上
+        var tv = (m.value || '').replace(/^https?:\/\//, '');
+        return t('map.openPrefix', tv.length > 16 ? tv.slice(0, 16) + '…' : (tv || '—'));
+      }
       default: return null;
     }
   }
@@ -2405,6 +2480,17 @@ input[type=range]::-moz-range-thumb{width:14px;height:14px;border-radius:50%;bac
       }
       if (d.id === selectedKey) b.classList.add('selected');
       else b.classList.remove('selected');
+      // ★ 本地补丁：配了双击/长按的键右上角点个记号，不然只能点进去才知道
+      var extra = !!(m && ((m.double && m.double.type) || (m.long && m.long.type)));
+      b.classList.toggle('has-extra', extra);
+      var tips = [];
+      if (d.sub) tips.push(t(d.sub));
+      if (extra) {
+        if (m.double && m.double.type) tips.push(t('map.gestureDouble') + '：' + (describe(m.double) || '—'));
+        if (m.long && m.long.type) tips.push(t('map.gestureLong') + '：' + (describe(m.long) || '—'));
+      }
+      if (tips.length) b.setAttribute('title', tips.join('\n'));
+      else b.removeAttribute('title');
     });
   }
 
@@ -2511,9 +2597,11 @@ input[type=range]::-moz-range-thumb{width:14px;height:14px;border-radius:50%;bac
     $('#fieldMods').hidden = !(type === 'combo' || type === 'holdcombo');
     $('#fieldMouse').hidden = !(type === 'mouse' || type === 'holdmouse');
     $('#fieldText').hidden = (type !== 'text');
+    $('#fieldOpen').hidden = (type !== 'open');
   }
 
   function selectKey(id, scroll) {
+    if (selectedKey !== id) currentGesture = 'single';   // 换键就回到「单击」档
     selectedKey = id;
     renderPadLabels();
     renderMappingPanel();
@@ -2552,15 +2640,53 @@ input[type=range]::-moz-range-thumb{width:14px;height:14px;border-radius:50%;bac
     head.appendChild(badge);
 
     var m = (config && config.keys ? config.keys[selectedKey] : null) || null;
-    var shown = m || effectiveMapping(selectedKey);
+    var base = m || effectiveMapping(selectedKey);
+
+    // ★ 本地补丁：双击/长按读的是 base.double / base.long，单击读 base 本身。
+    //   没配过的那一档显示成空表单（类型默认 key），用户可以临时切过去配一条。
+    var shown = (currentGesture === 'single')
+      ? base
+      : ((base && base[currentGesture]) || null);
+
+    var holdSingle = !!(base && base.type &&
+      (base.type === 'hold' || base.type === 'holdcombo' || base.type === 'holdmouse'));
+
+    // 分段按钮：当前档高亮；已经配过的那几档加个点
+    $$('#mapGesture button').forEach(function (b) {
+      var g = b.getAttribute('data-g');
+      b.classList.toggle('active', g === currentGesture);
+      var has = false;
+      if (g === 'single') has = !!(base && base.type);
+      else has = !!(base && base[g] && base[g].type);
+      b.classList.toggle('on', has && g !== currentGesture);
+    });
+
+    // 按住型的单击没法再判长按（按住时间被它占了），这里先说明白
+    if (currentGesture !== 'single' && holdSingle) {
+      $('#mapGestureHint').textContent = t('map.hintHoldConflict');
+    } else if (currentGesture === 'double') {
+      $('#mapGestureHint').textContent = t('map.hintDouble');
+    } else if (currentGesture === 'long') {
+      $('#mapGestureHint').textContent = t('map.hintLong');
+    } else {
+      $('#mapGestureHint').textContent = (!m && base) ? t('map.hintInherit') : '';
+    }
 
     $('#mapType').value = shown ? shown.type : 'key';
+    panelLastType = $('#mapType').value;
     buildMods($('#mapMods'), shown ? shown.mods : []);
     $('#mapValue').value = (shown && shown.value && MOUSE_VALUES.indexOf(shown.value) < 0) ? shown.value : '';
     $('#mapText').value = (shown && shown.text) ? shown.text : '';
+    // 新建的映射默认勾上「打完自动回车」—— 绝大多数人配文本就是为了"一下发出去"；
+    // 想让文本只插进输入框、不提交，取消勾选即可。已存过的映射尊重原样。
+    $('#mapEnter').checked = shown ? !!shown.enter : true;
+    $('#mapOpen').value = (shown && shown.type === 'open') ? (shown.value || '') : '';
     $('#mapMouse').value = (shown && MOUSE_VALUES.indexOf(shown.value) >= 0) ? shown.value : 'wheel_up';
 
-    $('#btnSaveMap').textContent = t('map.save');
+    $('#btnSaveMap').textContent = (currentGesture === 'single')
+      ? t('map.save') : t('map.saveThis');
+    $('#btnClearMap').textContent = (currentGesture === 'single')
+      ? t('map.clear') : t('map.clearThis');
 
     if (selectedKey === 'voice') {
       hint.textContent = t('map.hintVoice');
@@ -2579,6 +2705,10 @@ input[type=range]::-moz-range-thumb{width:14px;height:14px;border-radius:50%;bac
       m.value = $('#mapMouse').value;
     } else if (type === 'text') {
       m.text = $('#mapText').value;
+      // ★ 本地补丁：打完自动回车 —— 少这一行，界面上勾了也存不下来
+      if ($('#mapEnter').checked) m.enter = true;
+    } else if (type === 'open') {
+      m.value = ($('#mapOpen').value || '').trim();
     }
     if (type === 'combo' || type === 'holdcombo') m.mods = readMods($('#mapMods'));
     return m;
@@ -2617,19 +2747,32 @@ input[type=range]::-moz-range-thumb{width:14px;height:14px;border-radius:50%;bac
     });
   }
 
+  // ★ 本地补丁：一条映射的规范化。enter / repeat / double / long 必须原样带回来 ——
+  //   原来只挑 type/value/mods/text 四个字段，界面上随便点一下保存，
+  //   "自动回车""按住连发""双击/长按"就全被抹掉了（后端照单全收）。
+  function normMapping(m) {
+    if (!m || typeof m !== 'object' || !m.type) return null;
+    var out = {
+      type: m.type,
+      value: m.value == null ? '' : String(m.value),
+      mods: Array.isArray(m.mods) ? m.mods.slice() : [],
+      text: m.text == null ? '' : String(m.text)
+    };
+    if (m.type === 'text' && m.enter) out.enter = true;
+    if (m.repeat) out.repeat = true;
+    GESTURES.forEach(function (g) {
+      var sub = normMapping(m[g]);
+      if (sub) out[g] = sub;
+    });
+    return out;
+  }
+
   function normalizeConfig(r) {
     var keys = {};
     if (r.keys && typeof r.keys === 'object') {
       Object.keys(r.keys).forEach(function (k) {
-        var m = r.keys[k];
-        if (m && typeof m === 'object' && m.type) {
-          keys[k] = {
-            type: m.type,
-            value: m.value == null ? '' : String(m.value),
-            mods: Array.isArray(m.mods) ? m.mods.slice() : [],
-            text: m.text == null ? '' : String(m.text)
-          };
-        }
+        var m = normMapping(r.keys[k]);
+        if (m) keys[k] = m;
       });
     }
     return {
@@ -3367,7 +3510,15 @@ input[type=range]::-moz-range-thumb{width:14px;height:14px;border-radius:50%;bac
     });
 
     // 映射面板
-    $('#mapType').addEventListener('change', syncMappingFields);
+    $('#mapType').addEventListener('change', function () {
+      var cur = $('#mapType').value;
+      // ★ 本地补丁：刚从别的类型切到「文本」时自动勾上"打完回车"——
+      //   配文本的绝大多数场景就是"按一下把这段话发出去"，少勾这一步很反直觉。
+      //   已经存过的 text 映射按它自己的设置来，不动。
+      if (cur === 'text' && panelLastType !== 'text') $('#mapEnter').checked = true;
+      panelLastType = cur;
+      syncMappingFields();
+    });
     bindCapture($('#mapCapture'), $('#mapValue'), $('#mapCaptureHint'), function () {
       var type = $('#mapType').value;
       return type === 'combo' || type === 'holdcombo';
@@ -3375,27 +3526,68 @@ input[type=range]::-moz-range-thumb{width:14px;height:14px;border-radius:50%;bac
     $('#btnSaveMap').addEventListener('click', function () {
       if (!selectedKey) return;
       var m = currentPanelMapping();
-      if (m.type !== 'text' && m.type !== 'mouse' && !m.value) {
-        toast(t('toast.pickKey'), true);
+      if (m.type !== 'text' && m.type !== 'mouse' && m.type !== 'holdmouse' && !m.value) {
+        toast(t(m.type === 'open' ? 'toast.openEmptyWarn' : 'toast.pickKey'), true);
         return;
       }
       if (m.type === 'text' && !m.text) {
         toast(t('toast.textEmptyWarn'), false);
       }
       if (!config) return;
-      config.keys[selectedKey] = m;
+      if (currentGesture === 'single') {
+        // ★ 本地补丁：单击这条必须把已有的双击/长按**带上**，否则改一次单击
+        //   就把两个副作用悄悄删了（面板只编辑其中一档）。
+        var prev = config.keys[selectedKey];
+        if (prev && prev.type) {
+          GESTURES.forEach(function (g) { if (prev[g]) m[g] = prev[g]; });
+        }
+        config.keys[selectedKey] = m;
+      } else {
+        var base = config.keys[selectedKey];
+        if (!base || !base.type) {
+          toast(t('toast.needSingleFirst'), true);
+          return;
+        }
+        base[currentGesture] = m;
+        config.keys[selectedKey] = base;
+      }
       saveConfig();
       renderConfigAll();
     });
     $('#btnClearMap').addEventListener('click', function () {
       if (!selectedKey || !config) return;
-      if (Object.prototype.hasOwnProperty.call(config.keys, selectedKey)) {
+      var has = Object.prototype.hasOwnProperty.call(config.keys, selectedKey);
+      if (!has) {
+        toast(t('toast.noSuchMap'));
+      } else if (currentGesture === 'single') {
+        // 清单击：如果还挂着双击/长按，先问一句 —— 一起删掉的话两个副作用也没了
+        var base = config.keys[selectedKey];
+        if (base && (base.double || base.long) && !window.confirm(t('confirm.clearSingle'))) {
+          return;
+        }
         delete config.keys[selectedKey];
         saveConfig();
       } else {
-        toast(t('toast.noSuchMap'));
+        var b2 = config.keys[selectedKey];
+        if (b2 && b2[currentGesture]) {
+          delete b2[currentGesture];
+          // 两档都没了、只剩个空壳：把整条删掉，避免留下 type 为空的脏数据
+          if (!b2.double && !b2.long) delete config.keys[selectedKey];
+          else config.keys[selectedKey] = b2;
+          saveConfig();
+        } else {
+          toast(t('toast.noSuchMap'));
+        }
       }
       renderConfigAll();
+    });
+    $$('#mapGesture button').forEach(function (b) {
+      b.addEventListener('click', function () {
+        var g = b.getAttribute('data-g');
+        if (g === currentGesture) return;
+        currentGesture = g;
+        renderMappingPanel();
+      });
     });
 
     // 工具栏

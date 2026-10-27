@@ -9,19 +9,34 @@
 > 针对 **Chromecast 蓝牙语音遥控器 A3 款**（`VID_18D1&PID_9450`）做的适配补丁，
 > 上游版本在这台机器上**按键全无反应**，问题与修复见 **[`补丁说明.md`](补丁说明.md)**（英文 [`PATCHES.en.md`](PATCHES.en.md)）。
 >
-> 改了 **4 个文件**，全部带 `★ 本地补丁` 注释标记，方便日后跟上游合并：
+> 改了 **5 个文件**（`+769 / −67`），全部带 `★ 本地补丁` 注释标记，方便日后跟上游合并：
 >
 > | 文件 | 改动 | 解决什么 |
 > |---|---|---|
 > | `hidlocal.py` | **新增** | frida 钩 `NtDeviceIoControlFile` 在本机**一次都收不到报文**，改为直接读 HID 设备（`SetupAPI` + `ReadFile`），不需提权、不碰 frida |
-> | `keys.py` | +229 行 | 上游键码表是 `report ID 0x02` + usage `0x0042`，本机是 `0x01` + `0x0003`，**完全不重叠** → 按 report ID 分表 |
+> | `keys.py` | +489 行 | 上游键码表是 `report ID 0x02` + usage `0x0042`，本机是 `0x01` + `0x0003`，**完全不重叠** → 按 report ID 分表 |
 > | `keys.py` | 连发 | `hold` 依赖键盘驱动的自动重复，`SendInput` 合成的 keydown **不会**触发重复 → 加 `repeat` 标记 + 软件连发（0.35s 后每 0.08s 一次） |
 > | `keys.py` | 新增 `text` / `open` 类型 | 按键发一段文本（可自动回车提交）、按键开网址或程序 |
-> | `app.py` | +44 行 | 网页界面认识新类型、保存时保留 `repeat`/`enter` 标记、给 A3 一套推荐键位 |
+> | `keys.py` | **手势层** | 一个键分**单击 / 双击 / 长按**：`double` / `long` 两条子映射，节奏 300ms / 550ms（照搬无线麦 RC003） |
+> | `app.py` | +100 行 | 网页界面认识新类型、保存时**递归**保留 `repeat`/`enter`/`double`/`long`、给 A3 一套推荐键位 |
+> | `web/index.html` | +228 行 | 「触发方式」分段选择、「打完自动回车发送」开关、`open` 类型可编辑；`normMapping()` 不再丢字段 |
 > | `tap.js` | +19 行 | 原来只清 `0x02` 开头的报文的 usage、还把 report ID 一起清零；改为 `0x01`/`0x02` 都认，从偏移 1 开始写 |
 >
-> **语音不在 HID 通道里**，走的 ATVV（`ab5e0001~4`）+ IMA ADPCM，这部分上游本来就是对的；
-> 但 BLE 是**单链路**，必须让 Windows 的 HID 先握住连接、语音客户端再复用同一个 GATT 会话，
+> **一个键干三件事**（界面里点「双击」「长按」两个页签就能配，不用手写 JSON）：
+>
+> ```json
+> "ok": {
+>   "type": "key", "value": "ENTER",
+>   "double": {"type": "key",  "value": "ESC"},
+>   "long":   {"type": "text", "text": "/clear", "enter": true}
+> }
+> ```
+>
+> `enter: true` = 打完这段文本**自动按回车发出去**（界面上的「打完自动按回车发送」）。
+> 注意：配了双击后单击会晚 300ms 才触发（它在等第二下），所以**别给方向键配双击**；
+> 配了双击/长按，`repeat` 连发会自动失效（按住时间被长按判定占用了）。
+>
+> **语音不在 HID 通道里**，走的 ATVV（`ab5e0001~4`）+ IMA ADPCM，这部分上游本来就是对的；> 但 BLE 是**单链路**，必须让 Windows 的 HID 先握住连接、语音客户端再复用同一个 GATT 会话，
 > 否则只能看到 5 个服务、看不到 `ab5e0001`。这条踩坑记录也写在补丁说明里。
 >
 > 上游项目：[`Tilkmilk/vibe-mote`](https://github.com/Tilkmilk/vibe-mote) · 许可证同上游（见 [`LICENSE`](LICENSE)）
