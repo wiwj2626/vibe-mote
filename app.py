@@ -1577,6 +1577,31 @@ def run_reset_bt(on_line):
         on_line(i18n.L(f"失败：{e!r}", f"Failed: {e!r}"))
 
 
+def run_bt_capture(on_line, seconds=60):
+    """已经以管理员身份在跑：执行提权脚本的 --bt-capture，把输出喂给界面。
+
+    抓的是 BTHPORT 的 ETW 事件 402（ACL 里的 ATT 报文）。用途见
+    elevate_setup.bt_capture 的说明：谷歌遥控器的普通按键是属性句柄 0x0029 上的
+    8 字节 ATT 通知（静音 = 首字节 0x08），而 Windows 的 HID 类驱动只翻译了其中
+    一部分，静音/音量/电源/输入源在驱动层就被丢掉了 —— 所以必须下到 ATT 层才看得见。
+    """
+    import subprocess
+    on_line(i18n.L(f"开始采集蓝牙报文（{seconds} 秒）—— 【请在窗口内按一下静音键】",
+                   f"Capturing Bluetooth traffic for {seconds} s — press the mute key now"))
+    try:
+        p = subprocess.run([sys.executable, ELEVATE_PY, "--bt-capture", str(int(seconds))],
+                           capture_output=True, text=True, encoding="utf-8",
+                           errors="replace", cwd=HERE, timeout=int(seconds) + 240)
+        for ln in (p.stdout or "").splitlines():
+            on_line(ln)
+        if p.stderr:
+            on_line((p.stderr or "").strip()[:300])
+        on_line(i18n.L("采集结束 —— 导出的文件在 bt_capture 目录里",
+                       "Capture finished — exported files are in the bt_capture folder"))
+    except Exception as e:
+        on_line(i18n.L(f"失败：{e!r}", f"Failed: {e!r}"))
+
+
 def follow_elevate_log():
     """提权后的进程没有 stdout 给我们，所以它把过程写进 elevate_setup.log，
     这里跟着读出来显示在界面上（daemon 线程，进程退出就一起走）。"""
@@ -2959,6 +2984,21 @@ class Handler(BaseHTTPRequestHandler):
                     msg = i18n.L(f"自检失败：{e!r}", f"Self-check failed: {e!r}")
             BUS.log(msg)
             return self._json({"ok": True, "msg": msg})
+        if act == "bt-capture":
+            # 抓一次蓝牙 ATT 报文（BTHPORT ETW / 事件 402）。要管理员。
+            try:
+                secs = max(15, min(180, int(body.get("seconds") or 60)))
+            except Exception:
+                secs = 60
+            if not os.path.exists(ELEVATE_PY):
+                return self._json({"ok": False, "msg": i18n.L(
+                    "缺少 elevate_setup.py", "elevate_setup.py is missing")})
+            if not is_elevated():
+                return self._json({"ok": False, "msg": i18n.L(
+                    "需要管理员权限", "Administrator rights required")})
+            return self._json({"ok": True, "job": background(
+                i18n.L("蓝牙报文采集", "Bluetooth capture"),
+                lambda ol: run_bt_capture(ol, secs))})
         if act == "reset-bt":
             # 重置蓝牙电台：BLE 外设只接受一个连接，系统 HID 有时会把那条唯一的连接
             # 攥住不放（遥控器从此不广播 → 程序永远连不上）。拔电池能解开，

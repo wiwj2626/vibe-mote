@@ -383,7 +383,97 @@ def reset_bluetooth():
     return False
 
 
+def bt_capture(seconds=60):
+    """抓一次蓝牙 ATT 报文（BTHPORT ETW 提供程序，事件 402），导出 CSV/XML。
+
+    为什么非要抓这一层（2026-10-27）：
+
+      谷歌遥控器的**普通按键**是 **8 字节 ATT 通知**（属性句柄 0x0029），
+      首字节就是按键码：
+
+          电源 01   上 03   下 04   左 05   右 06   确定 07
+          静音 08   首页 0A   返回 0B
+          音量加 0C   音量减 0D   YouTube 0E   Netflix 0F   输入源 11
+
+      Windows 的 **HID 类驱动只翻译了报告描述符里声明的那几个键**
+      （上下左右确定返回首页 YouTube Netflix），静音/音量/电源/输入源在驱动层
+      就被丢掉了 —— 所以无论怎么用 HidD_ReadFile 读都读不到它们。
+
+      要看到就得下到 ATT 层：BTHPORT 的 ETW 提供程序
+      {8A1F9517-3A8C-4A9E-A018-4F17A200F277}，事件 402 的 ACL 数据里带完整报文。
+      抓之前要先打开 BTHPORT 的"详细事件"开关（要管理员）。
+    """
+    import subprocess
+    outdir = os.path.join(HERE, "bt_capture")
+    try:
+        os.makedirs(outdir, exist_ok=True)
+    except Exception as e:
+        log("✗ 建目录失败 %r" % (e,))
+        return 1
+    etl = os.path.join(outdir, "bt.etl")
+    csv = os.path.join(outdir, "bt.csv")
+    xml = os.path.join(outdir, "bt.xml")
+
+    log("=== 蓝牙报文采集（BTHPORT ETW / 事件 402）===")
+    if not is_admin():
+        log("✗ 不是管理员，什么都没做。")
+        log("DONE")
+        return 1
+    log("管理员权限 ✓")
+
+    try:
+        import winreg
+        with winreg.CreateKeyEx(winreg.HKEY_LOCAL_MACHINE,
+                                 r"SYSTEM\CurrentControlSet\Services\BthPort\Parameters",
+                                 0, winreg.KEY_SET_VALUE) as k:
+            winreg.SetValueEx(k, "EtwLogSensitiveData", 0, winreg.REG_DWORD, 1)
+            winreg.SetValueEx(k, "MaxEtwBytes", 0, winreg.REG_DWORD, 0x400)
+            winreg.SetValueEx(k, "EtwDropLargeEvents", 0, winreg.REG_DWORD, 0)
+        log("✓ BTHPORT 详细事件已开启")
+    except Exception as e:
+        log("✗ 开详细事件失败：%r" % (e,))
+
+    def run(args, timeout=60):
+        try:
+            pr = subprocess.run(args, capture_output=True, text=True,
+                                encoding="utf-8", errors="replace", timeout=timeout)
+            return ((pr.stdout or "") + (pr.stderr or "")).strip()
+        except Exception as e:
+            return "ERR %r" % (e,)
+
+    run(["logman", "stop", "BtHci", "-ets"])
+    out = run(["logman", "create", "trace", "BtHci",
+               "-p", "{8A1F9517-3A8C-4A9E-A018-4F17A200F277}",
+               "0xFFFFFFFFFFFFFFFF", "0xFF", "-o", etl, "-ets"])
+    log("logman create: %s" % out[:300])
+    log("▶ 采集开始，%d 秒窗口 —— 【现在请按一下静音键】另外按下上、音量加一下" % seconds)
+    time.sleep(seconds)
+
+    run(["logman", "stop", "BtHci", "-ets"])
+    log("采集结束，正在导出…")
+    run(["tracerpt", etl, "-o", csv, "-of", "CSV", "-y"], timeout=180)
+    run(["tracerpt", etl, "-o", xml, "-of", "XML", "-y"], timeout=180)
+    for f in (etl, csv, xml):
+        try:
+            log("  %s  %d 字节" % (f, os.path.getsize(f)))
+        except Exception:
+            log("  %s  不存在" % f)
+    log("DONE")
+    return 0
+
+
 def main():
+    # 抓一次蓝牙 ATT 报文（BTHPORT ETW 事件 402）
+    if "--bt-capture" in sys.argv:
+        try:
+            open(LOG, "w", encoding="utf-8").close()
+        except Exception:
+            pass
+        secs = 60
+        for a in sys.argv[1:]:
+            if a.isdigit():
+                secs = max(10, min(300, int(a)))
+        return bt_capture(secs)
     # 只重置蓝牙电台（不动自启/任务）：给界面上那个「重置蓝牙电台」按钮用
     if "--reset-bt" in sys.argv:
         try:
