@@ -1720,6 +1720,27 @@ def set_autostart(on, on_line=None):
 
 
 # ============================================================ 角色管理
+def _wait_keytap_ready(keytap, timeout=3.0):
+    """等按键角色的本地 HID 把设备集合打开 —— 那等于「系统握住了这条 BLE 链路」。
+
+    为什么值得阻塞启动：语音必须等 HID 先握上链路才建链，否则只能枚举到 5 个基础
+    服务、看不到 ATVV（详见 Roles.start 里的说明）。实测打开句柄只要几十毫秒，
+    3 秒是兜底上限。
+
+    拿不到也**不阻塞启动**：设备不在 / 句柄打不开时直接返回 False，语音那边
+    `hid_probe()` 会自己判断「HID 没在」并退回自行连接（没有抢链这回事）。
+    """
+    end = time.time() + timeout
+    while time.time() < end:
+        if getattr(keytap, "ready", False):
+            return True
+        sf = getattr(keytap, "stop_flag", None)
+        if sf is not None and sf.is_set():
+            return False
+        time.sleep(0.05)
+    return bool(getattr(keytap, "ready", False))
+
+
 class Roles:
     """把语音和按键两个角色装在本进程的线程里，并提供启动/停止/重启。"""
 
@@ -1769,22 +1790,42 @@ class Roles:
         # 否则会出现"刚启动那几秒按了没反应"。它由 _ensure_qwen_flag() 负责（见那里的注释）。
         self._ensure_qwen_flag()
         with self.lock:
+            # ★★ 启动顺序是硬约束：**先按键（HID），后语音**。
+            #
+            #   为什么（真机反复踩过）：BLE 外设同一时间只接受一个客户端，而这支遥控器
+            #   只在「它和已配对的 Windows 之间那条链路」上暴露完整服务表（10 个，含
+            #   ab5e0001 ATVV）。语音若先建链，枚举到的只有 5 个基础服务
+            #   （1800/1801/180a/180f/1813），ATVV 整个消失；更糟的是它每 3 秒重试一次、
+            #   每次都在蓝牙栈里留一条半开连接，把 Windows 的 HID 一起挤掉 ——
+            #   表现就是「按语音键没反应」，过几分钟连方向键都不动了。
+            #
+            #   上游是语音在前，所以每重启一次客户端就踩一次。这里改成：按键先起，
+            #   等它真的把设备集合打开（就等于系统握住了链路），再起语音。
+            if self.keytap is None and importlib.util.find_spec("frida") is not None:
+                import keys as keys_mod
+                self.keytap = keys_mod.KeyTap(self._on_event)
+                self.keytap.set_mapping(self.cfg.get("keys") or {})
+                self.keytap.start()
+                _wait_keytap_ready(self.keytap, 3.0)
             if self.voice is None:
                 import voice as voice_mod
                 self.voice = voice_mod.VoiceRole(
                     self._on_event, addr=self.cfg.get("remote_addr"),
                     audio=self.cfg.get("audio"), voice_spec=self.cfg.get("voice"),
                     relay=bool((self.cfg.get("audio") or {}).get("relay", True)))
+                if self.keytap is not None:
+                    # 把「HID 是否握着链路」告诉语音：HID 在的时候，语音只在
+                    # 「遥控器刚有按键」的窗口里建链，平时不碰链路（见 voice._wait_hid_awake）。
+                    self.voice.hid_probe = lambda: bool(getattr(self.keytap, "ready", False))
                 self.voice.start()
-            if self.keytap is None and importlib.util.find_spec("frida") is not None:
-                import keys as keys_mod
-                self.keytap = keys_mod.KeyTap(self._on_event)
-                self.keytap.set_mapping(self.cfg.get("keys") or {})
-                if self.voice is not None:
-                    # 遥控器一发报文就叫醒语音角色去重连：它只在按键后醒一小会，
-                    # 而这正是唯一能连上的窗口（退避最多 45 秒，靠等会全错过）。
-                    self.keytap.on_activity = self.voice.poke
-                self.keytap.start()
+            if self.voice is not None and self.keytap is not None:
+                # 遥控器一发报文就叫醒语音角色去重连：它只在按键后醒一小会，
+                # 而这正是唯一能连上的窗口（退避最多 45 秒，靠等会全错过）。
+                self.keytap.on_activity = self.voice.poke
+                if getattr(self.keytap, "_last_key_at", 0):
+                    # 按键比语音先起来 —— 中间这几百毫秒里按下的键，语音没听见，
+                    # 补一次唤醒，否则它会一直等下一次按键。
+                    self.voice.poke()
         BUS.log(i18n.L("客户端已启动", "Client started"))
         BUS.push({"ev": "state", "state": state_snapshot(self.cfg, self)})
         return True, i18n.L("已启动", "Started")

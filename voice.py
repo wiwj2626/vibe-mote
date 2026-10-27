@@ -32,6 +32,10 @@ ATVV_CTL = "ab5e0002"
 ATVV_AUDIO = "ab5e0003"
 ATVV_STATUS = "ab5e0004"
 
+# ★ 遥控器「醒着」的判定窗口：按下任意键之后，它大约还会醒这么久。
+#   这是语音唯一值得尝试连接的时机 —— 睡得越久越连不上，等没有意义。
+HID_AWAKE_WINDOW_S = 20.0
+
 SR_IN, SR_OUT = 16000, 48000
 
 
@@ -835,6 +839,11 @@ class VoiceRole(threading.Thread):
         self.voice = VoiceKey(self.voice_spec)
         self.stop_flag = threading.Event()
         self._poke = threading.Event()      # 遥控器有按键活动 → 立刻重试连接
+        # ★ 链路守卫：只要系统 HID 正握着这条唯一的 BLE 链路，语音就**只**在
+        #   「刚有按键活动」的窗口里尝试连接（见 _wait_hid_awake）。
+        self.hid_probe = None               # callable() -> bool：系统 HID 是否在握着链路
+        self._activity_at = 0.0             # 遥控器最近一次按键活动的时间
+        self._gate_logged = 0.0             # 上一次"等唤醒"提醒的时间（限流用）
         self.sink = None
         self.relay_obj = None
         self.connected = False
@@ -850,6 +859,9 @@ class VoiceRole(threading.Thread):
         self._watch = None
         self._client = None
         self._loop = None
+        self._ctl = None                    # ATVV 控制特征（补发 GET_CAPS 用）
+        self._caps_at = 0.0                 # 上次发 GET_CAPS 的时间（限流）
+        self._last_press_frames = None      # 上一段按住收到的音频帧数
 
     # ---------- 对外 ----------
     def poke(self):
@@ -858,8 +870,62 @@ class VoiceRole(threading.Thread):
         为什么关键：BLE 外设只在刚醒的一小段时间里能被连上（之后又睡，
         或被系统 HID 拿走那唯一的连接），而失败退避最长要等 45 秒 ——
         靠"等"就把窗口全错过去了。按键钩子（keys.KeyTap.on_activity）负责叫醒这里。
+
+        ★ 这里还记下活动时刻：`_wait_hid_awake()` 用它判断"现在是不是那个窗口"。
         """
+        self._activity_at = time.time()
         self._poke.set()
+
+    async def _wait_hid_awake(self):
+        """守门：系统 HID 握着链路、而遥控器在睡 —— 这时**绝不去建链**。
+
+        真机血泪（这条比任何一处修复都重要）：
+
+          · BLE 外设同一时间只接受**一个**客户端；
+          · 这支遥控器只在「它和已配对的 Windows 之间那条链路」上暴露完整服务表
+            （10 个，含 ab5e0001 ATVV）。我们自己新建一条链路时，枚举结果只剩
+            5 个基础服务（1800/1801/180a/180f/1813），ATVV 整个消失 ——
+            日志就是「缺少 ATVV 特征」，看着特别像"这支遥控器没有语音功能"；
+          · 真正的灾难是它会**把系统 HID 挤掉**：语音每 3 秒发起一轮连接，每轮都
+            留一条半开连接在蓝牙栈里，Windows 的 HID 再也握不上那条链路 ——
+            于是"按语音键没反应"过几分钟就变成"连方向键都不动了"。
+
+        所以：只要 `hid_probe()` 说 HID 在，语音就只在「按键活动后 20 秒内」尝试；
+        其余时间**安静等着**（不刷日志、不占链路）。用户按任意键（包括语音键）
+        就会叫醒这里 —— 那本来也是唯一能连上的时机。
+        """
+        if self.hid_probe is None:
+            return
+        waited = 0.0
+        while not self.stop_flag.is_set():
+            try:
+                hid_ok = bool(self.hid_probe())
+            except Exception:
+                hid_ok = False
+            if not hid_ok:
+                # HID 没握着链路（设备不在 / 走了 frida 旁路）→ 没有"抢链"这回事，
+                # 退回老行为：语音自己连。
+                return
+            if time.time() - self._activity_at <= HID_AWAKE_WINDOW_S:
+                if waited >= 1.0:
+                    self._log(f"语音：系统 HID 已握住链路（等了 {waited:.0f} 秒）"
+                              f"—— 开始建语音连接")
+                return
+            now = time.time()
+            if now - self._gate_logged >= 60.0:
+                self._gate_logged = now
+                if waited <= 0.0:
+                    self._log("语音：等遥控器醒一次 —— 先按一下遥控器任意键，"
+                              "让系统 HID 握住这条唯一的蓝牙链路，语音才连得上"
+                              "（不按键硬连只会把 HID 挤掉，两个一起失灵）")
+                else:
+                    self._log(f"语音：已等 {waited:.0f} 秒还没等到按键 —— "
+                              f"按一下遥控器任意键即可")
+                self.note = i18n.L("等遥控器按键唤醒（按任意键）",
+                                   "Waiting for a remote button press")
+                self._emit("status", {"connected": False, "note": self.note})
+            await asyncio.sleep(0.5)
+            waited += 0.5
 
     async def _maybe_unstick(self):
         """连续几次"扫不到广播"之后**自动解卡**：把蓝牙关开一次。
@@ -1126,6 +1192,7 @@ class VoiceRole(threading.Thread):
         每次新连接都会被当成第二个客户端 —— 重连治不好，只有换进程才行。
         """
         c, self._client = self._client, None
+        self._ctl = None
         if c is None:
             return
         try:
@@ -1135,6 +1202,11 @@ class VoiceRole(threading.Thread):
 
     async def _loop_sessions(self):
         while not self.stop_flag.is_set():
+            # ★ 每一轮都先过守卫：系统 HID 握着链路时，语音必须等「刚有按键」这个窗口，
+            #   否则会把自己和 HID 一起搞掉（详见 _wait_hid_awake 的注释）。
+            await self._wait_hid_awake()
+            if self.stop_flag.is_set():
+                break
             try:
                 await self._session()
             except asyncio.CancelledError:
@@ -1290,25 +1362,29 @@ class VoiceRole(threading.Thread):
             self.misses += 1
             self._log(f"语音：缺少 ATVV 特征（本次枚举到 {len(uuids)} 个服务："
                       f"{', '.join(uuids) or '空'}）")
-            if self.misses >= 3:
-                self._log("语音：连续 3 次看不到 ATVV —— 这个进程里的蓝牙会话已经"
-                          "乱了。请点「重启」重新拉起客户端（重连治不好）。")
-            if not getattr(self, "_variant_hinted", False):
-                # ★ 只看到通用服务（1800/1801/180a/180f）、没有 ab5e… → 这支遥控器
-                #   **根本没有语音服务**。真机上见过：同一款"G9N9N/GA01919"兼容款，
-                #   不同批次差别很大 —— 有的带语音，有的只有 HID 按键。这句话直接给用户
-                #   一个结论和一条出路，省得反复怀疑软件。
-                self._variant_hinted = True
-                self._log(i18n.L(
-                    "语音：这台遥控器**没有语音服务**（ATVV，ab5e0001）—— 它多半不是原装"
-                    "G9N9N / GA01919（兼容款批次差异很大：同一链接买的两支可能一支能一支不能）。"
-                    "语音功能用不了，按键映射可能仍然可用。换一支原装遥控器，"
-                    "或改用 Google TV Streamer（2024）那支遥控器即可。",
-                    "Voice: this remote has **no voice service** (ATVV, ab5e0001) — it is very "
-                    "likely not a genuine G9N9N / GA01919 (compatible units vary a lot between "
-                    "batches: two remotes from one listing can behave differently). Voice will not "
-                    "work; key mapping may still work. Use a genuine remote, or the Google TV "
-                    "Streamer (2024) remote."))
+            # ★ 只在基础服务里转圈 = 这条链路是**我们自己新建**的（不是复用系统 HID 那条）。
+            #   这时候最该做的是立刻松手、把链路让回 HID，等下一次按键再试 —— 而不是
+            #   连着重试。原来这里连续重试，正是"语音键没反应 → 方向键也不动了"的成因。
+            self._activity_at = 0.0
+            if self.misses < 3:
+                self._log("语音：这条链路不是系统 HID 那条（自己新建的链看不到 ATVV）"
+                          "—— 已断开让回 HID，请按一下遥控器任意键，我再试一次")
+            else:
+                if not getattr(self, "_variant_hinted", False):
+                    # ★ 连续多次、每次都只有通用服务（1800/1801/180a/180f）、没有 ab5e…
+                    #   → 这支遥控器**根本没有语音服务**。真机上见过：同一款
+                    #   "G9N9N/GA01919"兼容款，不同批次差别很大 —— 有的带语音，有的只有
+                    #   HID 按键。这句话直接给用户一个结论和一条出路，省得反复怀疑软件。
+                    self._variant_hinted = True
+                    self._log(i18n.L(
+                        "语音：连续 3 次都只看得到基础服务、没有 ATVV —— 这支遥控器多半"
+                        "**没有语音服务**（它多半不是原装 G9N9N / GA01919；兼容款批次差异很大）。"
+                        "按键映射不受影响。若你确认它有语音，请点「重启」重新拉起客户端，"
+                        "并按一下遥控器任意键再试。",
+                        "Voice: three attempts in a row showed only the basic services and no "
+                        "ATVV — this remote most likely has **no voice service** (probably not a "
+                        "genuine G9N9N / GA01919). Key mapping is unaffected. If you are sure it "
+                        "does have voice, click “Restart” and press any remote button."))
             await self._close_current()
             return
 
@@ -1345,8 +1421,12 @@ class VoiceRole(threading.Thread):
             try:
                 await client.write_gatt_char(ctl, bytes([0x0A, 0x00, 0x04, 0x00, 0x01]),
                                              response=False)
+                self._caps_at = time.time()
             except Exception as e:
                 self._log(f"语音：GET_CAPS 发送失败（不影响收流）: {e}")
+        # 补发 GET_CAPS 要用到这两样（见 _rearm_caps）
+        self._ctl = ctl
+        self._last_press_frames = None
 
         how = "按一下" if self.voice.mode == "tap" else "按住"
         if self.voice.ok:
@@ -1379,9 +1459,54 @@ class VoiceRole(threading.Thread):
             await self._close_current()
 
     # ---------- 语音键事件 ----------
+    def _rearm_caps(self, delays=(0.0, 0.30)):
+        """补发 GET_CAPS —— 让遥控器重新进录音态。
+
+        为什么需要：GET_CAPS 只在**建链时**发一次，而遥控器会在两次按语音键之间
+        自己休眠。醒来后它照样发 0x04（"我按下了"），却一帧音频都不送 ——
+        日志就是「本段 0~5 帧」，听感是"按了语音键但没声音、输入法不出字"，
+        很容易被误判成"语音键坏了"。
+
+        真机上 0x04 到达时补发一次就能恢复，但偶尔要再来一次，所以发两遍
+        （立刻 + 0.3 秒后），两遍都是写特征、开销可以忽略。
+        """
+        ctl = getattr(self, "_ctl", None)
+        loop = getattr(self, "_loop", None)
+        client = self._client
+        if ctl is None or loop is None or client is None:
+            return
+        if time.time() - getattr(self, "_caps_at", 0.0) < 1.0:
+            return                        # 刚发过，别重复刷
+        self._caps_at = time.time()
+
+        async def _do():
+            for i, d in enumerate(delays):
+                if d:
+                    await asyncio.sleep(d)
+                if not client.is_connected:
+                    return
+                try:
+                    await client.write_gatt_char(
+                        ctl, bytes([0x0A, 0x00, 0x04, 0x00, 0x01]), response=False)
+                    if i == 0:
+                        self._log("语音：上一段没收到音频 —— 补发 GET_CAPS"
+                                  "（让遥控器重新进录音态）")
+                except Exception as e:
+                    self._log(f"语音：补发 GET_CAPS 失败 {type(e).__name__}: {e}")
+                    return
+
+        try:
+            loop.call_soon_threadsafe(lambda: asyncio.ensure_future(_do()))
+        except Exception:
+            pass
+
     def _on_status(self, b: bytes):
         active = getattr(self, "_active", False)
         if b[0] == 0x04 and not active:
+            # 上一段"按了却没音频" → 这次按下时先把录音态补回来（见 _rearm_caps）
+            prev = getattr(self, "_last_press_frames", None)
+            if prev is not None and prev < 20:
+                self._rearm_caps()
             self._active = True
             self.sessions += 1
             self._session_frames = 0
@@ -1396,6 +1521,7 @@ class VoiceRole(threading.Thread):
             self._emit("key", {"id": "voice", "down": False})
             self.voice.release()
             n = self._session_frames
+            self._last_press_frames = n
             self._log(f"语音：▲ 结束（本段 {n} 帧音频 ≈ {n / 62.5:.1f}s）")
             if n < 20:
                 # 按键通了、但遥控器没送音频 —— 这是另一类问题（没真正进录音态），
