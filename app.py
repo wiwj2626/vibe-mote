@@ -1661,6 +1661,56 @@ def run_bt_capture(on_line, seconds=60):
     say(i18n.L("采集完成", "capture done"))
 
 
+def run_remote_unpair(on_line, mac="70:4F:10:6D:03:A2"):
+    """删掉蓝牙里的遥控器（要管理员），删完提示重新配对。
+
+    什么时候用：按了红外键（音量/静音/电源/输入源）之后语音永久失效 —— 实测软件
+    侧救不回来（协商 / 关麦 / 开麦 / 全域会话号扫描 / 重连都试过）。删设备重配是
+    唯一确定的恢复手段；这个动作把「设置 → 蓝牙 → 找设备 → 删除」那几步变成一键。
+    """
+    import subprocess
+    needle = mac.replace(":", "").replace("-", "").upper()
+
+    def say(m):
+        on_line(m)
+        BUS.log("[重新配对] " + m)
+
+    def run(args, timeout=30):
+        try:
+            pr = subprocess.run(args, capture_output=True, text=True,
+                                encoding="utf-8", errors="replace", timeout=timeout)
+            return ((pr.stdout or "") + (pr.stderr or ""))
+        except Exception as e:
+            return "ERR %r" % (e,)
+
+    # 用 pnputil 自己枚举（不碰 shell），找出所有 InstanceId 里带 MAC 的节点
+    ids = []
+    for cls in ("Bluetooth", "HIDClass"):
+        out = run(["pnputil", "/enum-devices", "/class", cls])
+        for ln in out.splitlines():
+            if "Instance ID:" in ln and needle in ln.upper().replace(":", "").replace("&", ""):
+                iid = ln.split("Instance ID:", 1)[1].strip()
+                if iid and iid not in ids:
+                    ids.append(iid)
+    if not ids:
+        say(i18n.L("没找到这台遥控器的设备节点 —— 可能已经删过了，"
+                   "直接按住【返回】+【主页】配对即可",
+                   "no device node found for this remote — it may already be removed; "
+                   "just hold Back + Home to pair"))
+        return
+    say(i18n.L(f"找到 {len(ids)} 个设备节点，正在删除…",
+               f"found {len(ids)} device node(s), removing…"))
+    for iid in ids:
+        say(f"  pnputil /remove-device {iid} -> " + run(["pnputil", "/remove-device", iid]).strip()[:120])
+    say(i18n.L(
+        "设备已删除。现在**同时按住遥控器的【返回】+【主页】约 5 秒**，直到指示灯开始闪，"
+        "然后到「设置 → 蓝牙 → 添加设备」里选它配对。配好后按一下遥控器任意键，"
+        "客户端会自动接管。",
+        "Device removed. Now **hold the remote's [Back] + [Home] for about 5 s** until "
+        "the LED blinks, then pair it in Settings → Bluetooth → Add device. After that, "
+        "press any remote button and the client picks it up automatically."))
+
+
 def follow_elevate_log():
     """提权后的进程没有 stdout 给我们，所以它把过程写进 elevate_setup.log，
     这里跟着读出来显示在界面上（daemon 线程，进程退出就一起走）。"""
@@ -3004,6 +3054,14 @@ class Handler(BaseHTTPRequestHandler):
                 "已丢掉当前会话，正在重连（约 20 秒）" if ok else "重连没发起 —— 当前没有会话",
                 "Dropped the session, reconnecting (~20 s)" if ok
                 else "Nothing to reconnect — no active session")})
+        if act == "remote-unpair":
+            # 一键重配：删掉蓝牙里的遥控器（软件侧救不回语音时唯一的确定恢复手段）。
+            if not is_elevated():
+                return self._json({"ok": False, "msg": i18n.L(
+                    "需要管理员权限", "Administrator rights required")})
+            return self._json({"ok": True, "job": background(
+                i18n.L("重新配对遥控器", "Re-pair remote"),
+                lambda ol: run_remote_unpair(ol))})
         if act == "voice-repair":
             # 「一键修复语音僵死」：关麦 → 开麦 → 看遥控器回不回话。
             # 不重启客户端、不动 HID 链路、不重新配对。
