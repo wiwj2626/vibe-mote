@@ -981,7 +981,7 @@ class VoiceRole(threading.Thread):
             self._wake_rearm_at = time.time()
             self._try_open_mic()
 
-    def _try_open_mic(self, hold=1.5):
+    def _try_open_mic(self, hold=1.5, quiet=False):
         """主动开一次麦；开完没人说话就把麦收回去（不留麦开着）。
 
         为什么需要它：遥控器一旦把麦克风关掉，就**不会再发 0x04**，于是我们永远
@@ -996,8 +996,9 @@ class VoiceRole(threading.Thread):
             return
         if not self.atvv_cmd(MIC_OPEN_CMD):
             return
-        self._log("语音：遥控器有按键活动 —— 主动开一次麦（MIC_OPEN），"
-                  "看看能不能把录音通道叫醒")
+        if not quiet:
+            self._log("语音：遥控器有按键活动 —— 主动开一次麦（MIC_OPEN），"
+                      "看看能不能把录音通道叫醒")
 
         def _close_if_idle():
             if self.stop_flag.is_set():
@@ -1946,6 +1947,7 @@ class VoiceRole(threading.Thread):
         这条提示说清楚（每 5 分钟最多一条，别刷屏）。
         """
         last_hint = 0.0
+        last_probe = 0.0
         while not self.stop_flag.is_set() and self.connected:
             await asyncio.sleep(5.0)
             if not self.connected:
@@ -1955,17 +1957,31 @@ class VoiceRole(threading.Thread):
                 continue
             if now - last_hint < 300.0:
                 continue
-            last_hint = now
-            self._log(i18n.L(
-                "语音：空闲中（已停止周期性 GET_CAPS —— 这台固件不支持能力协商，"
+            # ★ 定时"重新开麦"探测（每 20 秒一次，和提示节流无关）：这是让「误按静音键」自动恢复的关键。
+            #   静音键在这支原厂遥控器上**不上链路**（ETW 全链路抓包证实），我们
+            #   看不到它；但实测它会让遥控器把 ATVV 录音通道挂起 —— 之后它连
+            #   0x04 都不发，语音就再也起不来。
+            #   而"MIC_OPEN"（遥控器本来就认的命令，参考实现按下语音键时就发它）
+            #   能把它重新打开 —— 实测 15:41:10 主动开麦之后，15:41:18 的语音
+            #   就正常了（47 帧）。
+            #   问题是"语音键本身不上 HID"，所以用户只按语音键时我们毫无察觉。
+            #   那就定时自己开一次：静音之后最多 ~20 秒，下一次按语音键就有声音。
+            #   开完 1.5 秒没人说话就收回去，不留麦开着。
+            if now - last_probe >= 20.0:
+                last_probe = now
+                self._try_open_mic(quiet=True)
+            if now - last_hint >= 300.0:
+                last_hint = now
+                self._log(i18n.L(
+                "语音：空闲中（不再发 GET_CAPS —— 这台固件不支持能力协商，"
                 "再喊也没用，而且历史上正是它把遥控器搞晕过）。"
-                "若此时按语音键没反应，多半是遥控器侧的 ATVV 僵死了，"
-                "需要在「设置 → 蓝牙」里删掉设备重新配对。",
-                "Voice: idle (periodic GET_CAPS is gone — this firmware does not "
-                "support capability negotiation, so asking is pointless, and it is "
-                "exactly what used to wedge the remote). If the voice key does nothing "
-                "now, the remote's ATVV is wedged: remove and re-pair it in Settings → "
-                "Bluetooth."))
+                "每 20 秒会自动开一次麦，把「误按静音键」造成的挂起解掉；"
+                "若按语音键仍然没反应，点界面上的「修复语音」或取电池 10 秒。",
+                "Voice: idle (no more GET_CAPS — this firmware does not support "
+                "capability negotiation, and it is exactly what used to wedge the "
+                "remote). The mic is re-opened automatically every 20 s, which undoes "
+                "the hang caused by pressing the mute key; if the voice key still does "
+                "nothing, use “Repair voice” or pull the battery for 10 s."))
 
     async def _silent_watch(self, sessions0, wait=20.0):
         """连上 wait 秒还没收到任何语音数据 → 提示一句，但别把人吓着。
