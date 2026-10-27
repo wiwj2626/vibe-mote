@@ -25,6 +25,8 @@ layer (timing lifted from the RC003 reference implementation).
 | Text needs a second OK press to send | Text stops in the input box | Upstream UI has no "auto Enter" switch | UI switch "Press Enter after typing", auto-checked for text (§5.4) |
 | Voice key does nothing, then even the D-pad dies | Log: `缺少 ATVV 特征（枚举到 5 个服务）`, then endless retries | **Startup order inverted**: voice grabs the single BLE link first and its retries also starve the HID stack (§8) | Start HID first and wait for it to hold the link; voice only connects inside a "a key was just pressed" window (§8) |
 | Voice key pressed but no audio, no text | Log: `本段 0~5 帧音频` | `GET_CAPS` is sent only once at connect time; the remote never re-enters recording state after sleeping | Re-send `GET_CAPS` twice on the next press when the previous press was starved (§8.5) |
+| Keys dead after a battery swap / re-pair | Log: `重新打开失败，退回 frida 旁路` | It hands over to frida as soon as HID cannot be opened, and frida reads nothing here | Retry every 2 s; once local reading worked it never falls back to frida (§8.6) |
+| Bluetooth shows "connect then immediately disconnect" | Voice connects every 3 s, right into the HID rebuild | Voice misreads "HID not open yet" as "HID absent" | Three-state guard: hands off entirely while `reconnecting` (§8.6) |
 
 ---
 
@@ -462,16 +464,68 @@ misdiagnose as a broken key.
 (< 20 frames), re-sends GET_CAPS twice on the next press** (immediately and 0.3 s later), which puts
 the remote back into recording state.
 
-### 8.6 How to verify
+### 8.6 Fix 4: a three-state HID guard — hands off while the link is rebuilt
+
+After a battery swap or a re-pair, Windows has to rebuild the BLE **HID child devices**, and the
+link flaps ("connected → immediately disconnected" in Bluetooth settings) for several rounds. That
+is the most fragile moment, and the old code made two mistakes exactly there:
+
+| Mistake | Consequence |
+| --- | --- |
+| `keys.py` gave up after 2 s and fell back to frida | frida reads **zero reports** on this machine → keys are dead, looking like a hardware failure |
+| Voice treated "HID not open yet" as "HID absent" and kept connecting every 3 s | It cut into the rebuild and stretched it indefinitely — that is the flapping |
+
+Fixes:
+
+- **`keys.py` is patient now**: when the HID collection cannot be opened it retries every 2 s (up to
+  600 s, with a hint every 30 s); a lost handle retries **forever**. Once local HID reading has ever
+  been established it **never falls back to frida** — the worst case here is "wait", not "give up".
+- **`app._hid_state()` went from a boolean to three states**:
+
+  | State | Meaning | What voice does |
+  | --- | --- | --- |
+  | `ok` | local HID reading is running, HID holds the link | connect only inside the 20 s post-press window |
+  | `reconnecting` | just acquired (8 s settle) / just lost / still waiting for HID | **never touches the link**, and voids the press window |
+  | `absent` | not local HID (frida bypass / device truly gone) | connects on its own; no link-stealing concern |
+
+  `KeyTap.starting` covers "just started, path not chosen yet" and is treated as `reconnecting`;
+  otherwise voice misreads it as `absent` and steals the link.
+
+### 8.7 Recovery procedure that actually worked on hardware
+
+If keys **and** voice both stop working, or Bluetooth keeps flapping, follow this order — it is the
+sequence that fixed the real machine, not a theoretical one:
+
+1. **Settings → Bluetooth → remove "Chromecast Remote"** (unpair);
+2. **Take the batteries out for 10 s**, put them back;
+3. **Pair again** (Bluetooth → Add device → hold the remote's pairing combo);
+4. Start the client and wait for `按键映射：本地 HID 直读（1 个集合…）`;
+5. **Press any remote button** — this lets the HID stack hold the link and opens voice's connect window;
+6. Wait for `语音：已连接遥控器` → `语音：链路自检 —— 电量 …` → `语音：就绪`;
+7. Hold the voice key and speak.
+
+The "link self-check" line from step 6 is the most useful verdict — if battery/firmware/model read
+back, the link is genuinely bidirectional and any later "no sound" is not a link problem:
+
+```
+语音：链路自检 —— 电量 95%，固件=26.5，型号=A3，厂商=Google Inc.
+```
+
+Reference values from this machine: battery 95%, firmware 26.5, model A3, vendor Google Inc. After
+the fix, five consecutive voice sessions produced 93 / 98 / 70 / 140 / 112 frames — at 62.5 frames
+per second that is 1.5 s / 1.6 s / 1.1 s / 2.2 s / 1.8 s, and none was a 0–5 frame stub.
+
+### 8.8 How to verify
 
 ```bash
-python tests/test_gate.py      # 4 guard rules, no remote needed
+python tests/test_gate.py      # 5 guard rules, no remote needed
 ```
 
 On hardware: restart the client → the log must show `按键映射：本地 HID 直读` **first**, then
 `语音：等遥控器醒一次` (not `语音：连接遥控器…`) → press any remote button →
 `语音：系统 HID 已握住链路 —— 开始建语音连接` → `语音：已连接遥控器` → **10 services**
-(including `ab5e0001`) → `语音：就绪`.
+(including `ab5e0001`) → `语音：链路自检 —— 电量 …` → `语音：就绪` → hold the voice key →
+`语音：▼ 开始` / `▲ 结束（本段 60+ 帧）`.
 
 ---
 
@@ -488,19 +542,29 @@ On hardware: restart the client → the log must show `按键映射：本地 HID
 3. Press a D-pad key → `[按键] 上 → UP（按住·连发）`; **holding must keep moving**.
    The first press should also produce `语音：系统 HID 已握住链路 —— 开始建语音连接` and
    `语音：已连接遥控器`.
-4. Hold the voice key → `语音：▼ 开始`, release → `语音：▲ 结束（本段 N 帧音频 ≈ x.xs）`.
-   Frames must be well above zero (≈62 frames per second of speech); a handful of frames means
-   the remote never entered recording state — GET_CAPS is now re-sent on the next press (§8.5).
-5. **Double click**: map "double → `Esc`" on a key, press it twice quickly — only `Esc` fires,
+4. After connecting there should be `语音：链路自检 —— 电量 xx%，固件=…，型号=…，厂商=…`.
+   **If it reads back, the link is bidirectional**; only a failed read points at the link (then run
+   the recovery procedure in §8.7).
+5. Hold the voice key → `语音：▼ 开始`, release → `语音：▲ 结束（本段 N 帧音频 ≈ x.xs）`.
+   Frames must be well above zero (≈62.5 frames per second of speech — a 1.5 s sentence is ~93);
+   a handful of frames means the remote never entered recording state — GET_CAPS is re-sent on the
+   next press (§8.5).
+6. **Double click**: map "double → `Esc`" on a key, press it twice quickly — only `Esc` fires,
    **never** the single action as well. A single press fires the single action after 0.3 s
    (expected, see §5.2).
-6. **Long press**: map "long → open URL", hold for 0.6 s and release — only the URL opens,
+7. **Long press**: map "long → open URL", hold for 0.6 s and release — only the URL opens,
    the single action does not fire.
-7. **Send**: map a `text` with "Press Enter after typing" checked, press the key with an input
+8. **Send**: map a `text` with "Press Enter after typing" checked, press the key with an input
    box focused — the text should be **submitted immediately**, no second OK press.
 
-If step 1 instead shows `挂上蓝牙驱动宿主 WUDFHost (PID …)`, the local path failed and it fell
-back to frida (another app holds the HID collection exclusively, or the VID/PID differs).
+If step 1 instead shows `按键映射：暂时没打开遥控器的 HID 集合 —— 每 2 秒重试`, the remote is not
+connected yet (or Windows has not loaded the HID child devices): **press any remote button** and the
+client picks it up within 2 s; voice will report `系统 HID 正在重建` and stay off the link meanwhile
+(§8.6).
+
+If it shows `挂上蓝牙驱动宿主 WUDFHost (PID …)`, it waited the full 10 minutes and fell back to frida
+(**it never falls back once local reading has been established**). frida reads nothing on this machine
+— re-pair per §8.7.
 
 ---
 
@@ -508,12 +572,12 @@ back to frida (another app holds the HID collection exclusively, or the VID/PID 
 
 ```
  new: hidlocal.py      | 213
- app.py                | 159 +++++++++++++----
- keys.py               | 549 ++++++++++++++++++++++++++++++++++++++++++++++++---
+ app.py                | 190 +++++++++++++++----
+ keys.py               | 603 ++++++++++++++++++++++++++++++++++++++++++++++++++---
  tap.js                |  19 +-
- voice.py              | 164 +++++++++++++++--
+ voice.py              | 321 +++++++++++++++++++++++++++---
  web/index.html        | 228 ++++++++++++++++++++++--
- 6 files changed, 1237 insertions(+), 95 deletions(-)
+ 6 files changed, 1476 insertions(+), 98 deletions(-)
 ```
 
 By feature:
@@ -521,9 +585,9 @@ By feature:
 | File | Change | Section |
 | --- | --- | --- |
 | `hidlocal.py` | new: SetupAPI enumeration + `ReadFile` | §2 |
-| `keys.py` | `REPORT_TABLES`, `hidlocal` backend, `repeat`, `GestureRouter`, `open_target`, self-check counts local HID | §1 §2 §3 §5 |
-| `app.py` | startup order (HID first, then voice), `_wait_keytap_ready`, recommended keymap, `text`+`enter`, recursive `_clean_mapping`, gesture-aware `describe_mapping` | §4 §5 §8 |
-| `voice.py` | link guard `_wait_hid_awake`, `hid_probe`, hand the link back on a 5-service result, re-send `GET_CAPS` | §8 |
+| `keys.py` | `REPORT_TABLES`, `hidlocal` backend, `repeat`, `GestureRouter`, `open_target`, self-check counts local HID, **patient HID retry instead of falling back to frida** | §1 §2 §3 §5 §8.6 |
+| `app.py` | startup order (HID first, then voice), `_wait_keytap_ready`, **three-state `_hid_state` guard**, recommended keymap, `text`+`enter`, recursive `_clean_mapping`, gesture-aware `describe_mapping` | §4 §5 §8 |
+| `voice.py` | link guard `_wait_hid_awake` (three states), `hid_probe`, hand the link back on a 5-service result, **link self-check (battery/firmware/model)**, silent-session watchdog, re-send `GET_CAPS` | §8 |
 | `tap.js` | accepts `0x01`, fixed nullify offset | §1 (drive-by) |
 | `web/index.html` | gesture tabs, auto-Enter switch, `open` type, `normMapping` no longer drops fields | §5 |
 
