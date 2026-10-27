@@ -848,6 +848,12 @@ class KeyTap(threading.Thread):
         self._attached_at = 0.0
         self._av_hinted = False
         self.reports = 0
+        # ★ 本地补丁：本地 HID 直读路径的**按键**统计（(report_id, usage) -> 次数）。
+        #   和 frida 那条路的 self._hb["seen"] 作用一样，但本地路径不填 _hb，
+        #   导致自检在主路径上永远显示"收到 0 条" —— 用户按完键去看自检，只会
+        #   得出"HID 挂了"的错误结论。这里自己数一份。
+        self._seen = {}
+        self._last_key_at = 0.0
         self._held = set()          # 当前按住的 usage（过滤长按连发）
         self._script = None
         self._session = None
@@ -1152,6 +1158,10 @@ class KeyTap(threading.Thread):
         if not self._attached_pid:
             return i18n.L("按键映射没有在运行（先看「运行依赖」里 frida 是否齐全）",
                           "Key mapping is not running (first check that frida is installed)")
+        # ★ 本地补丁：本地 HID 直读路径不填 self._hb（那是 frida 心跳），必须走自己的统计。
+        #   否则主路径上自检永远报"「遥控器读」0 次 / 已收到 0 条按键报文"。
+        if self._attached_pid == os.getpid():
+            return self._selfcheck_local()
         hb = self._hb or {}
         lens = hb.get("lens") or {}
         dist = "、".join(f"{k} 字节×{v}" for k, v in sorted(lens.items())) or "无"
@@ -1197,6 +1207,52 @@ class KeyTap(threading.Thread):
             f"Key-mapping self-check: attached to host PID {self._attached_pid} "
             f"({host_n} WUDFHost processes on this machine), {ioctl} “remote read” calls in that "
             f"host, output lengths: {dist}; {sent} key reports received. {tip}") + extra
+
+    def _selfcheck_local(self):
+        """★ 本地补丁：本地 HID 直读路径的自检（进程内计数，不经 frida）。
+
+        这东西存在的唯一理由：**"按键没反应"必须先分清"没收到报文"和"收到了但没效果"**。
+        以前主路径上自检恒为 0，只会把人往"HID 挂了"的死胡同里带。
+        """
+        seen = dict(getattr(self, "_seen", {}) or {})
+        total = int(self.reports or 0)
+        keyn = sum(seen.values())
+        ago = time.time() - float(getattr(self, "_last_key_at", 0) or 0)
+        when = (i18n.L("还没按过任何键", "no key pressed yet")
+                if not keyn else i18n.L(f"最近一次按键在 {ago:.0f} 秒前", f"last key {ago:.0f}s ago"))
+        items = []
+        for (rid, u), n in sorted(seen.items(), key=lambda kv: -kv[1])[:16]:
+            name = usage_table_for(rid).get(u)
+            tag = "" if name else i18n.L("未知", "unknown")
+            items.append(f"{name or tag}(0x{u:04X}/ID{rid:02X})×{n}")
+        head = i18n.L(
+            f"按键映射自检（本地 HID 直读，进程内计数）：共收到 {total} 条报文，"
+            f"其中 {keyn} 条是按键；{when}。",
+            f"Key-mapping self-check (local HID, in-process counters): {total} reports, "
+            f"{keyn} of them key presses; {when}.")
+        body = ""
+        if items:
+            body = i18n.L(" 这台遥控器发过的键：" + "、".join(items),
+                          " Keys seen from this remote: " + ", ".join(items))
+        if keyn:
+            tip = i18n.L(
+                " 通道是通的 —— 某个键按了没反应，要么它不在这张键码表里（上面会显示「未知」），"
+                "要么它映射到的键目标程序不接受。",
+                " The path works — if one key does nothing, either it is not in the usage table "
+                "(shown as “unknown” above) or its mapped key is ignored by the target app.")
+        else:
+            tip = i18n.L(
+                " 现在按一下遥控器任意键，再点一次自检：仍然是 0 说明 HID 通道没读到"
+                "（先看蓝牙连接和「运行依赖」）。",
+                " Press any key on the remote and run the self-check again: still 0 means the HID "
+                "path is not reading (check the Bluetooth link and dependencies first).")
+        miss = i18n.L(
+            " ⚠ 如果你刚按了某个键、而上面的列表里没有它，说明这支遥控器根本没发那个键的 HID 报文"
+            " —— 音量、电源、静音、输入源在这一款上走红外，Windows 收不到。",
+            " ⚠ If you just pressed a key and it is missing from the list above, this remote never "
+            "sent that key over HID — volume, power, mute and input-source go over IR on this model, "
+            "so Windows cannot see them.")
+        return head + body + tip + miss
 
     def _pid_alive(self, pid):
         """进程还在不在（ctypes 直接问系统，比每次起 tasklist 便宜）。
@@ -1265,6 +1321,10 @@ class KeyTap(threading.Thread):
             for h in list(self._held):
                 self._release(*h)
             return
+        # ★ 本地补丁：在**查映射之前**统计 —— 没被映射、甚至不认识的 usage 也要记，
+        #   「这个键到底有没有报文」是排障里最关键的一条信息。
+        self._seen[hkey] = self._seen.get(hkey, 0) + 1
+        self._last_key_at = time.time()
         if hkey in self._held:
             return                      # 长按连发：只认第一下（按住不放由系统自动重复）
         self._held.add(hkey)
