@@ -609,6 +609,52 @@ Windows never sees them. Clones and genuine units share the same VID/PID
 That is hardware behaviour, not a software defect. To get a remappable mute key you
 need a clone remote.
 
+### 8.11 Known limitation: the mute key wedges the voice channel on a genuine A3
+
+**Symptom** (reproduced by the user, repeatedly): press the mute key once and the
+voice dies immediately; press mute again, press the voice key again — nothing comes
+back. Every other key keeps working.
+
+This is not "the mute mapping got messed up": the remote itself suspends its ATVV
+recording channel. Note that on this genuine A3 the mute key **never reaches the BLE
+link at all** (§8.10), so no mapping can be at fault — the IR mute action changes
+some internal state of the remote.
+
+**Four software remedies, all measured ineffective** (2026-10-27 15:42–15:54):
+
+| Remedy | When | Result |
+|---|---|---|
+| `MIC_OPEN` | 4 attempts at 15:42:13 / 15:42:33 / 15:43:21 / 15:43:50 | not one voice session started |
+| `MIC_CLOSE` | auto-closed 1.5 s after every open | no effect |
+| Periodic re-open (every 20 s) | idle watchdog | no effect |
+| **Fresh GATT session with a proper teardown** (`MIC_CLOSE` → disconnect → reconnect) | 15:53:00 → reconnected 15:53:18 (10 services, battery 95 %) | **still no effect** |
+
+The recovery at 15:41:18 was the remote getting better **on its own over time** —
+not any of the remedies. (That was misattributed to `MIC_OPEN` at one point; the log
+shows 4 further `MIC_OPEN` attempts at 15:42–15:43, all ineffective.)
+
+**The only recovery is pulling the battery for 10 s** — the remote reboots, its state
+machine resets, and the pairing survives. (If that still fails, re-pair the device.)
+
+**Practical advice: do not press the mute key.** On this genuine A3 it goes over IR
+because it is meant for the TV: it does nothing for the PC but kills the voice
+channel. Volume±, power and input-source behave the same way (also IR, also
+unreachable — §8.10).
+
+**Two real bugs found and fixed along the way** (unrelated to mute, equally fatal):
+
+1. **`await c.disconnect()` hangs on Windows** — when the peer does not answer,
+   WinRT never returns, so there is no "disconnected" log line, the session never
+   ends, and **the reconnect never happens**: the "button-press fallback reconnect"
+   was therefore completely inert. The session loop now tears itself down when it
+   sees a request flag (within 0.5 s), and the disconnect itself gets a 3 s timeout.
+2. **The periodic `GET_CAPS` was self-inflicted** — ATVV v1.0 uses 6 bytes and we
+   kept sending a malformed 5-byte one, which the remote ignores. Both observed
+   "voice died" events (13:36:06, 14:11:56) came right after a `GET_CAPS`, and in
+   both cases the remote was **idle** when it processed it — consistent with the
+   remote treating the malformed command as illegal and entering an error state.
+   It is now **never sent**.
+
 ## 9. Verification checklist
 
 1. Startup log should contain:

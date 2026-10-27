@@ -942,6 +942,7 @@ class VoiceRole(threading.Thread):
         self._watch = None
         self._client = None
         self._loop = None
+        self._reopen_requested = False
         self._ctl = None                    # ATVV 控制特征（补发 GET_CAPS 用）
         self._caps_at = 0.0                 # 上次发 GET_CAPS 的时间（限流）
         self._last_press_frames = None      # 上一段按住收到的音频帧数
@@ -1133,6 +1134,13 @@ class VoiceRole(threading.Thread):
 
         什么时候用：会话显示"已连接"，但按语音键什么都收不到（录音态/订阅已经
         僵了）。重连会重新走一遍订阅，等于给这条链路换一份干净的状态。
+
+        ★ 2026-10-27 15:49 修了一个隐蔽的坑：原来这里是 `await c.disconnect()`，
+          **在 Windows 上这个 await 会挂住**（BLE 外设不回应时 WinRT 不返回），
+          于是既没有"连接已断开"的日志、会话也不会结束，重连等于没发生 ——
+          "按键后备重连"这个功能因此完全失效。
+          现在改成：置一个标志让**会话循环自己收尾**（它会在 0.5 秒内看到），
+          断开操作带 3 秒超时，超时也照样把会话拆掉。
         """
         c = self._client
         loop = getattr(self, "_loop", None)
@@ -1140,10 +1148,11 @@ class VoiceRole(threading.Thread):
             return False
         self._activity_at = time.time()
         self._poke.set()
+        self._reopen_requested = True
 
         async def _do():
             try:
-                await c.disconnect()
+                await asyncio.wait_for(c.disconnect(), timeout=3.0)
             except Exception:
                 pass
 
@@ -1826,6 +1835,7 @@ class VoiceRole(threading.Thread):
         # 本次连接以来成功过几次语音会话（"按键后备"判定用）
         self._sessions_at_connect = self.sessions
         self._reopen_at = 0.0
+        self._reopen_requested = False
 
         def on_status(_c, data: bytearray):
             b = bytes(data)
@@ -1948,6 +1958,12 @@ class VoiceRole(threading.Thread):
                 if not client.is_connected:
                     self._log("语音：连接已断开")
                     break
+                if getattr(self, "_reopen_requested", False):
+                    # 有人要求重开语音会话：不靠 disconnect() 的回调（Windows 上
+                    # 它可能挂住），会话自己在这儿收尾，交给外层重新建链。
+                    self._reopen_requested = False
+                    self._log("语音：按要求重开语音会话（先 MIC_CLOSE 再断链）")
+                    break
                 await asyncio.sleep(0.5)
         finally:
             self.connected = False
@@ -2003,8 +2019,8 @@ class VoiceRole(threading.Thread):
                 self._log(i18n.L(
                 "语音：空闲中（不再发 GET_CAPS —— 这台固件不支持能力协商，"
                 "再喊也没用，而且历史上正是它把遥控器搞晕过）。"
-                "每 20 秒会自动开一次麦，把「误按静音键」造成的挂起解掉；"
-                "若按语音键仍然没反应，点界面上的「修复语音」或取电池 10 秒。",
+                "若按语音键没反应，多半是误按静音键把录音通道挂死了 —— "
+                "**取电池 10 秒**能解（软件侧已实测救不回来）。",
                 "Voice: idle (no more GET_CAPS — this firmware does not support "
                 "capability negotiation, and it is exactly what used to wedge the "
                 "remote). The mic is re-opened automatically every 20 s, which undoes "
@@ -2042,18 +2058,20 @@ class VoiceRole(threading.Thread):
             return
         self._log(i18n.L(
             "语音：链路正常，但 3 分钟里一条 ATVV 报文都没有 —— 遥控器的录音通道"
-            "多半僵死了。**按过静音键最容易触发**：静音键走红外，Windows 收不到它，"
-            "但它会把录音通道挂起。软件侧救不回来（重连 / MIC_CLOSE / MIC_OPEN / "
-            "GET_CAPS 都试过无效）。恢复办法：**删掉设备重新配对**（顺序必须是先删"
-            "再配对）。⚠ 不要只取电池 —— 实测只取电池会让 Windows 的 HID 子设备变成"
-            "幽灵设备，蓝牙里变成「已配对但连不上」，反而要多走一遍重配。",
+            "僵死了。**如果是按过静音键造成的，软件侧救不回来**（2026-10-27 实测："
+            "MIC_OPEN / MIC_CLOSE / 全新 GATT 会话，规范拆链后重建，四种手段全部无效）。"
+            "恢复办法：**取出电池等 10 秒装回**（遥控器整机重启，状态机清零；配对不丢）。"
+            "若取电池后仍不行，再考虑删设备重新配对。⚠ 别再按静音键了 —— 这支原厂 "
+            "A3 的静音走红外（是给电视用的），按了对电脑毫无影响，却会把语音通道挂死。",
             "Voice: the link is healthy, yet there has been no ATVV traffic for 3 "
-            "minutes — the remote's recording channel is most likely wedged. "
-            "**Pressing the mute key is the usual trigger**: it goes over IR so Windows "
-            "never sees it, but it suspends the recording channel. Nothing on the "
-            "software side recovers it (reconnect / MIC_CLOSE / MIC_OPEN / GET_CAPS were "
-            "all tried and failed). Recover by **removing the device and pairing again** "
-            "(remove first, then pair). Do NOT just pull the battery — measured on this "
+            "minutes — the remote's recording channel is wedged. **If the mute key "
+            "caused it, nothing on the software side recovers it** (measured "
+            "2026-10-27: MIC_OPEN / MIC_CLOSE / a fresh GATT session with a proper "
+            "teardown — all four failed). Recover by **pulling the battery for 10 s** "
+            "(the remote reboots and its state machine resets; the pairing survives). "
+            "If that does not help, re-pair the device. Do not press the mute key "
+            "again — on this genuine A3 it goes over IR (it is meant for the TV), so "
+            "it does nothing for the PC but kills the voice channel. "
             "machine, a battery pull alone leaves Windows' HID sub-devices as phantom "
             "nodes: Bluetooth then shows “paired but not connected” and you end up having "
             "to re-pair anyway."))
