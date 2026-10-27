@@ -1813,99 +1813,43 @@ class VoiceRole(threading.Thread):
             await self._close_current()
 
     async def _caps_keepalive(self, last_frame, every=20.0, idle=20.0):
-        """空闲保活 + **探活心跳**：问 GET_CAPS，看它答不答。
+        """空闲看门狗：**不再周期性发 GET_CAPS**。
 
-        为什么这么写（2026-10-27 修正）：以前这里的 GET_CAPS 发的是畸形报文
-        `0A 00 04 00 01`（5 字节，v1.0 要求 6 字节），遥控器直接忽略 —— 也就是
-        说这条"保活"路径**从来没起过作用**。而 `写成功` 只代表 ATT 层没报错，
-        代表不了遥控器认。
+        为什么彻底去掉（2026-10-27，依据是另一个成熟实现 + 本机实测）：
 
-        正确的 GET_CAPS 会换来一个 CAPS 应答（0x0B，9 字节）。于是它天然就是
-        心跳：
-          · 答了   → 遥控器 ATVV 栈活着，计数清零；
-          · 不答   → 3 秒超时算一次 miss；连续 CAPS_MISS_LIMIT 次 → 判定僵死，
-                     走一次强制重连，并明确告诉用户"这次重连也救不回来的话，
-                     就是遥控器侧卡死（按过静音键），要删设备重配"。
+          · 参考实现（remotemic-src/RC003）只在**会话建立时发一次** GET_CAPS，
+            从来不周期性发。我们以前每 20 秒发一次。
+          · 本机实测：**这台固件根本不回答 GET_CAPS**（14:16、14:21 两次建链，
+            连发几次都没有 0x0B 应答）。也就是说这个周期纯属"对空气喊话"。
+          · 更关键：以前那个周期发的是**畸形报文** `0A 00 04 00 01`（5 字节，
+            v1.0 要求 6 字节）。真机两次"语音莫名其妙全死"（13:12、13:34）都紧
+            跟在一次畸形保活之后 —— **有可能就是我们自己把遥控器搞晕的**。
+            现在命令字节已改成正确的 6 字节，但既然它不支持 CAPS，就没必要再喊。
 
-        只在**没有音频流**的时候问，绝不打断正在说的话。
+        现在这个协程只做一件事：**长时间没声音时**，把"可能僵死了、怎么恢复"
+        这条提示说清楚（每 5 分钟最多一条，别刷屏）。
         """
-        miss = 0
-        logged = 0.0
-        # ★★ 关键修正（2026-10-27 14:11 血泪）：**这台遥控器根本不回答 GET_CAPS**。
-        #    第一版探活把"问了不回"直接当成僵死，结果在语音完全正常的时候
-        #    （14:11:16 本段 58 帧、14:11:31 本段 74 帧）主动掐断了会话。
-        #    所以必须先确认"这个固件到底会不会答"：
-        #      · 一次都没答过 → 标记 caps_unsupported，**永久关闭僵死判定**，
-        #        只保留一条说明性日志，绝不再自动重连；
-        #      · 答过一次     → 之后"问了不回"才算真的僵死（可信）。
-        #    判据用"本会话有没有收到过 0x0B"，而不是"这次有没有收到"。
+        last_hint = 0.0
         while not self.stop_flag.is_set() and self.connected:
-            await asyncio.sleep(2.0)
+            await asyncio.sleep(5.0)
             if not self.connected:
                 break
             now = time.time()
             if now - last_frame[0] < idle:
                 continue
-            if now - getattr(self, "_caps_at", 0.0) < every:
+            if now - last_hint < 300.0:
                 continue
-
-            seen0 = getattr(self, "_caps_seen", 0)
-            self._rearm_caps(min_gap=every, reason="idle")
-            await asyncio.sleep(CAPS_TIMEOUT_S)
-            if not self.connected or self.stop_flag.is_set():
-                break
-
-            if getattr(self, "_caps_seen", 0) > seen0:
-                if miss:
-                    self._log(f"语音：探活恢复 —— 遥控器又开始回能力应答了")
-                miss = 0
-                if now - logged >= 300.0:
-                    logged = now
-                    self._log("语音：空闲保活中（GET_CAPS 有应答，链路健康）")
-                continue
-
-            # 问了不回。先看这个固件到底会不会答 —— 一次都没答过就不许判僵死。
-            if getattr(self, "_caps_supported", None) is not True:
-                if getattr(self, "_caps_supported", None) is None:
-                    self._caps_supported = False
-                    self._log("语音：这台遥控器不回答 GET_CAPS（能力协商不支持）—— "
-                              "已关闭「问不到就当僵死」的判定，避免把正常的会话误杀；"
-                              "健康判据改用「有没有收到 0x04 / 音频」。")
-                miss = 0
-                continue
-
-            miss += 1
-            self._log(f"语音：探活失败（第 {miss}/{CAPS_MISS_LIMIT} 次）—— "
-                      f"发了 GET_CAPS，{CAPS_TIMEOUT_S:.0f} 秒内没有能力应答")
-            if miss < CAPS_MISS_LIMIT:
-                # 还不到判定线：先来一发"重锤"（显式关麦 + 再问），有些固件认这个
-                self.atvv_cmd(MIC_CLOSE_CMD)
-                await asyncio.sleep(0.4)
-                seen0 = getattr(self, "_caps_seen", 0)
-                self._rearm_caps(min_gap=0.0, reason="idle")
-                await asyncio.sleep(CAPS_TIMEOUT_S)
-                if getattr(self, "_caps_seen", 0) > seen0:
-                    self._log("语音：MIC_CLOSE 之后重新问到了能力应答 —— 已恢复")
-                    miss = 0
-                continue
-
-            # 连续问不到 → 遥控器的 ATVV 栈僵死了
+            last_hint = now
             self._log(i18n.L(
-                "语音：连续两次问不到能力应答 —— 遥控器的 ATVV 已经僵死，"
-                "下面自动重连一次试试。若重连后按语音键仍然没反应，就不要再试了："
-                "这是遥控器侧的状态卡死（**按过静音键最容易触发**），"
-                "需要到「设置 → 蓝牙」里**删掉设备重新配对**（先删再配）。",
-                "Voice: two capability probes in a row went unanswered — the remote's "
-                "ATVV stack is wedged. Reconnecting once automatically now. If the voice "
-                "key still does nothing after that, stop retrying: the remote itself is "
-                "stuck (**pressing the mute key is the usual trigger**) and the device has "
-                "to be removed and paired again."))
-            self.note = i18n.L("语音通道僵死（按过静音键？需删设备重配）",
-                               "Voice channel wedged (mute key? re-pair needed)")
-            self._emit("status", {"connected": False, "note": self.note})
-            miss = 0
-            self.force_reconnect()
-            return
+                "语音：空闲中（已停止周期性 GET_CAPS —— 这台固件不支持能力协商，"
+                "再喊也没用，而且历史上正是它把遥控器搞晕过）。"
+                "若此时按语音键没反应，多半是遥控器侧的 ATVV 僵死了，"
+                "需要在「设置 → 蓝牙」里删掉设备重新配对。",
+                "Voice: idle (periodic GET_CAPS is gone — this firmware does not "
+                "support capability negotiation, so asking is pointless, and it is "
+                "exactly what used to wedge the remote). If the voice key does nothing "
+                "now, the remote's ATVV is wedged: remove and re-pair it in Settings → "
+                "Bluetooth."))
 
     async def _silent_watch(self, sessions0, wait=20.0):
         """连上 wait 秒还没收到任何语音数据 → 提示一句，但别把人吓着。
@@ -2080,6 +2024,11 @@ class VoiceRole(threading.Thread):
             prev = getattr(self, "_last_press_frames", None)
             if prev is not None and prev < 20:
                 self._rearm_caps()
+            # ★ 对齐参考实现（remotemic-src/RC003 的 ble_transport_winrt.py）：
+            #   主机在"按下语音键"时显式发 MIC_OPEN（0C 00），"松开"时发 MIC_CLOSE。
+            #   我们以前从不发 —— 全靠遥控器自己发 0x04 来开麦，主机这边是"哑"的"。
+            #   这是与成熟实现最大的一个行为差异，补上。
+            self.atvv_cmd(MIC_OPEN_CMD)
             self._active = True
             self.sessions += 1
             self._session_frames = 0
@@ -2095,6 +2044,8 @@ class VoiceRole(threading.Thread):
             self.voice.release()
             n = self._session_frames
             self._last_press_frames = n
+            # ★ 松开时显式关麦（同样对齐参考实现），下一段按下前状态是干净的。
+            self.atvv_cmd(MIC_CLOSE_CMD)
             self._log(f"语音：▲ 结束（本段 {n} 帧音频 ≈ {n / 62.5:.1f}s）")
             if n < 20:
                 # 按键通了、但遥控器没送音频 —— 这是另一类问题（没真正进录音态），

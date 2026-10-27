@@ -132,7 +132,8 @@ USAGE_TO_KEY_RC01 = {
     0x0001: "power",
     0x0003: "up", 0x0004: "down", 0x0005: "left", 0x0006: "right",
     0x0007: "ok",
-    0x0008: "mute",                     # ★ 静音键：一直在走 HID，之前漏了
+    0x0008: "mute",                     # 静音键（保留项：本机固件实测**不发**这个键，
+                                       #   但同款遥控器的编号表里它是 mute）
     0x000A: "home", 0x000B: "back",
     0x000C: "volup", 0x000D: "voldown",
     0x000E: "youtube", 0x000F: "netflix",
@@ -153,6 +154,12 @@ USAGE_TO_KEY_RC01 = {
 #       volume_up=0x0C  volume_down=0x0D  youtube=0x0E  netflix=0x0F
 #       input_source=0x11
 #   和我们实测到的 0x0003/0x0004/0x0005/0x000B 完全同一套编号，可以确信。
+#
+# ⚠ 但要诚实说明：**静音键(0x0008) 在本机实测是按了也不发报文的**
+#   （14:16、14:24 两次实测，Consumer 集合与厂商集合 page0xFF01 都是零报文）。
+#   所以这一项是"照抄编号表备着"，不是"实测到它会来"。同族的 0x0001/0x000C/
+#   0x000D/0x0011（电源/音量±/输入源）本机同样按了没反应 —— 这款遥控器的
+#   音量、电源、静音、输入源确实走红外，Windows 收不到。
 # 已知的 report ID -> 查表。没列到的按 0x02 那套处理（保持原行为）。
 REPORT_TABLES = {0x01: USAGE_TO_KEY_RC01, 0x02: USAGE_TO_KEY}
 
@@ -1380,6 +1387,29 @@ class KeyTap(threading.Thread):
         elif kind == "error":
             self._log(f"按键映射：{payload.get('message')}")
 
+    def _note_dropped(self, raw):
+        """记下"收到了、但因为长度不是 3 字节被丢掉"的原始报文（去重，最多 20 条）。
+
+        为什么要留这个：静音键折腾了一整天的根因，两次都是"收到了但被静默丢掉"
+        （一次是键码表缺项，一次是报文长度不是 3 字节）。这类 bug 的共同特征是
+        **日志完全空白**，所以看不见的东西必须打出来。
+        """
+        seen = getattr(self, "_dropped_seen", None)
+        if seen is None:
+            seen = self._dropped_seen = set()
+        if raw in seen or len(seen) >= 20:
+            return
+        seen.add(raw)
+        n = len(raw.split())
+        rid = raw.split()[0] if raw.split() else "??"
+        self._log(i18n.L(
+            f"按键映射：收到一条 {n} 字节报文（report ID 0x{rid}）：{raw} —— "
+            f"程序目前只解析 3 字节格式，所以这条不会产生任何按键。"
+            f"如果这是你想要的那个键（比如静音/音量），把这条原始行发给我就能加。",
+            f"Key mapping: got a {n}-byte report (report ID 0x{rid}): {raw} — only the "
+            f"3-byte format is parsed, so this produces no key. If this is the key you "
+            f"want (mute/volume?), send me this raw line and it can be supported."))
+
     def _on_report(self, raw):
         """raw 形如 '02 42 00'（标准款）或 '01 03 00'（A3 / CR PVT 款）。"""
         self.last_seen = time.time()
@@ -1390,7 +1420,15 @@ class KeyTap(threading.Thread):
                 pass
         parts = raw.split()
         if len(parts) != 3:
-            return                      # 遥控器固定 3 字节；9 字节是别的键鼠
+            # ★★ 2026-10-27 又一个"静默丢弃"的坑，比键码表那个更隐蔽：
+            #    `on_activity()` 在**上面**已经调用过了，所以按静音键时语音会被叫醒
+            #    （日志有"系统 HID 已握住链路"），但报文在这里被整条扔掉 ——
+            #    既没有 `[按键]`，也没有"未知键"，连原始字节都看不到。
+            #    本机实测打开全部集合后多出来一个 page0xFF01 / 21 字节的厂商集合，
+            #    它发的每一条报文都走这个分支。
+            #    现在把丢掉的行打出来（按内容去重，最多 20 条），至少能看见它长什么样。
+            self._note_dropped(raw)
+            return
         try:
             b = [int(x, 16) for x in parts]
         except ValueError:
