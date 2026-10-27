@@ -73,9 +73,27 @@ async def t_window_expires():
     raise AssertionError("过期窗口仍然放行")
 
 
+async def t_blocked_while_reconnecting():
+    """HID 正在重建（刚换电池/重新配对）→ 一步都不许动，哪怕刚按过键。
+
+    这一条对应真机上「蓝牙里看着连上了、马上又断」：那段时间 Windows 在重建
+    HID 子设备，语音插进去建链会把重建无限拉长。
+    """
+    v = new_role("reconnecting")
+    v.poke()                                  # 刚按过键，窗口是开的
+    try:
+        await asyncio.wait_for(v._wait_hid_awake(), timeout=1.5)
+    except asyncio.TimeoutError:
+        assert v._activity_at == 0.0, "重建期间必须把按键窗口作废"
+        print("  [OK] 重建期间一步都不动，且按键窗口已作废")
+        return
+    raise AssertionError("重建期间放行了 —— 会把 Windows 的 HID 重建搅乱")
+
+
 async def main():
     tests = [
         ("HID 在 + 没按键 → 死等", t_blocked_when_asleep),
+        ("HID 正在重建 → 死等", t_blocked_while_reconnecting),
         ("HID 在 + 刚按键 → 放行", t_pass_after_poke),
         ("HID 不在 → 不拦", t_pass_when_no_hid),
         ("窗口过期 → 重新等", t_window_expires),

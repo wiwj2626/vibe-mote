@@ -1720,6 +1720,36 @@ def set_autostart(on, on_line=None):
 
 
 # ============================================================ 角色管理
+# 刚把 HID 握上来的这几秒，算"稳定期"：语音不许插手。
+# 为什么需要它：换电池 / 重新配对后，Windows 要重建 HID 子设备，这段时间链路
+# 会"连上又断"好几轮；我们的语音若正好插进去建链，会把重建过程搅得更久，
+# 表现就是「蓝牙里看着连上了、马上又断」。
+HID_SETTLE_S = 8.0
+
+
+def _hid_state(keytap):
+    """系统 HID 现在握着那条 BLE 链路吗？三态比布尔值有用得多。
+
+    `"ok"`           —— 本地直读在跑，链路被 HID 握着：语音只能用"按键窗口"那一下；
+    `"reconnecting"` —— 刚握上/刚掉了，Windows 正在重建 HID：语音**绝对不许**碰链路；
+    `"absent"`       —— 走的不是本地直读（frida 旁路 / 设备根本不在）：语音自己连。
+    """
+    if keytap is None:
+        return "absent"
+    # ★ 按键角色还在等 HID 出现（刚启动 / 刚换完电池）—— 必须当"正在重建"看待。
+    #   如果这里返回 absent，语音会以为"HID 不在"而抢着建链，正好把重建搅乱：
+    #   真机上就是「蓝牙里看着连上了、马上又断」。
+    if getattr(keytap, "starting", False):
+        return "reconnecting"
+    if not getattr(keytap, "local_hid", False):
+        return "absent"
+    if getattr(keytap, "ready", False):
+        if time.time() - getattr(keytap, "opened_at", 0.0) < HID_SETTLE_S:
+            return "reconnecting"
+        return "ok"
+    return "reconnecting"
+
+
 def _wait_keytap_ready(keytap, timeout=3.0):
     """等按键角色的本地 HID 把设备集合打开 —— 那等于「系统握住了这条 BLE 链路」。
 
@@ -1814,9 +1844,10 @@ class Roles:
                     audio=self.cfg.get("audio"), voice_spec=self.cfg.get("voice"),
                     relay=bool((self.cfg.get("audio") or {}).get("relay", True)))
                 if self.keytap is not None:
-                    # 把「HID 是否握着链路」告诉语音：HID 在的时候，语音只在
-                    # 「遥控器刚有按键」的窗口里建链，平时不碰链路（见 voice._wait_hid_awake）。
-                    self.voice.hid_probe = lambda: bool(getattr(self.keytap, "ready", False))
+                    # 把「HID 现在握着链路吗」告诉语音（三态，见 _hid_state）：
+                    # HID 在的时候，语音只在「遥控器刚有按键」的窗口里建链；
+                    # HID 正在重建的时候，语音一步都不许动。
+                    self.voice.hid_probe = lambda: _hid_state(self.keytap)
                 self.voice.start()
             if self.voice is not None and self.keytap is not None:
                 # 遥控器一发报文就叫醒语音角色去重连：它只在按键后醒一小会，

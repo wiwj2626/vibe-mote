@@ -467,6 +467,11 @@ GESTURE_DOUBLE_S = 0.30      # 双击窗口：两下之间最长间隔
 GESTURE_LONG_S = 0.55        # 按住超过这个时长算长按
 HOLD_TYPES = ("hold", "holdcombo", "holdmouse")
 
+# 启动时打不开 HID 集合，最多等这么久再退回 frida。
+# 换电池 / 重新配对之后 Windows 要重建 HID 子设备，通常 5~15 秒；退太早会误入
+# frida 那条在本机读不到报文的路（按键直接废掉），所以宁可多等。
+HID_REOPEN_WAIT_S = 600.0
+
 
 class GestureRouter:
     """把「遥控器按下/松开」翻译成 单击 / 双击 / 长按 三种触发。
@@ -858,6 +863,17 @@ class KeyTap(threading.Thread):
         self._script = None
         self._session = None
         self._lock = threading.Lock()
+        # ★ 本地补丁：语音角色靠这三项判断「系统 HID 现在握着链路吗」——
+        #   `local_hid` 走的是本地直读（= HID 握着链路），frida 旁路不算；
+        #   `opened_at` 用来给"刚握上来的那几秒"留一个稳定期；
+        #   `_had_device` 记住"曾经有过设备"，句柄掉了说明正在重建，而不是没有。
+        self.local_hid = False
+        self.opened_at = 0.0
+        self._had_device = False
+        self._lost_logged = False
+        # 还没决定走哪条路（正在等 HID 集合出现）。这段时间语音必须当"正在重建"看待，
+        # 否则它会误以为"HID 不在"而抢先建链 —— 恰恰把重建过程搅乱。
+        self.starting = True
 
     # ---------- 对外 ----------
     def set_mapping(self, mapping):
@@ -925,13 +941,39 @@ class KeyTap(threading.Thread):
         vid, pid = self._local_ids()
         cols = hidlocal.open_collections(vid, pid)
         if not cols:
-            self._log("按键映射：本地没找到遥控器的 Consumer 集合，改用 frida 旁路")
-            return False
+            # ★ 别急着退回 frida：本机 frida 那条路**一次报文都读不到**（见文件头），
+            #   退过去等于按键直接废掉。而"暂时打不开"最常见的原因是遥控器刚休眠 /
+            #   刚重新配对 / 刚换电池后 Windows 还在重建 HID 子设备 —— 按一下遥控器
+            #   按键它就连回来了。所以这里耐心等，而不是立刻投降。
+            self._log("按键映射：暂时没打开遥控器的 HID 集合 —— 每 2 秒重试"
+                      "（按一下遥控器任意键，它连上来就能立刻接上）")
+            start = time.time()
+            end = start + HID_REOPEN_WAIT_S
+            last_hint = start
+            while not self.stop_flag.is_set() and time.time() < end:
+                time.sleep(2.0)
+                cols = hidlocal.open_collections(vid, pid)
+                if cols:
+                    break
+                if time.time() - last_hint >= 30.0:
+                    last_hint = time.time()
+                    self._log(f"按键映射：还没看到遥控器的 HID 集合（已等 "
+                              f"{time.time() - start:.0f} 秒）—— 按一下遥控器任意键")
+            if not cols:
+                self._log(f"按键映射：等了 {HID_REOPEN_WAIT_S:.0f} 秒仍打不开 HID 集合，"
+                          f"改用 frida 旁路（本机 frida 通常读不到报文）。"
+                          f"按一下遥控器按键后重启客户端即可回到直读")
+                self.starting = False
+                return False
 
         self._log(f"按键映射：本地 HID 直读（{len(cols)} 个集合，"
                   f"VID_{vid:04X}&PID_{pid:04X}，不经 frida、不需要提权）")
         self.note = i18n.L("运行中（本地 HID 直读）", "Running (local HID)")
         self._attached_pid = os.getpid()          # 自检里显示"挂在哪个宿主"用
+        self.local_hid = True                     # 语音用它判断"HID 是否握着链路"
+        self._had_device = True
+        self.starting = False
+        self.opened_at = time.time()
 
         def on_bytes(payload):
             self._on_report(hidlocal.to_report_hex(payload))
@@ -972,12 +1014,24 @@ class KeyTap(threading.Thread):
                 self.note = i18n.L("HID 设备暂时不在了（等遥控器重连）",
                                    "HID device is gone (waiting for the remote)")
                 self._emit("status", {"ready": False, "note": self.note})
-                time.sleep(2.0)
-                cols = hidlocal.open_collections(vid, pid)
-                if not cols:
-                    self._log("按键映射：重新打开失败，退回 frida 旁路")
-                    return False
+                # ★ 已经建立起直读之后**绝不退回 frida**：本机 frida 一条报文都读不到，
+                #   退过去只会让用户以为"按键彻底坏了"（换电池后真踩过）。
+                #   这里无限重试 —— 用户能接受"等一下"，不能接受"直接废掉"。
+                if not self._lost_logged:
+                    self._lost_logged = True
+                    self._log("按键映射：HID 句柄失效（多半是遥控器重新配对 / 换电池）"
+                              "—— 正在重开，按一下遥控器按键能加快恢复")
+                while not self.stop_flag.is_set():
+                    time.sleep(2.0)
+                    cols = hidlocal.open_collections(vid, pid)
+                    if cols:
+                        self._lost_logged = False
+                        self._log("按键映射：HID 已重新打开，继续直读")
+                        break
+                if self.stop_flag.is_set():
+                    break
             backoff = 1.0
+            self.opened_at = time.time()
             self._emit("status", {"ready": True, "note": self.note})
         self.ready = False
         return True

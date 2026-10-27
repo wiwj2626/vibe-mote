@@ -36,6 +36,31 @@ ATVV_STATUS = "ab5e0004"
 #   这是语音唯一值得尝试连接的时机 —— 睡得越久越连不上，等没有意义。
 HID_AWAKE_WINDOW_S = 20.0
 
+# GET_CAPS：让遥控器进录音态并回报能力表。0x0A 命令 / 版本 0x00 / 长度 4 / 负载。
+CAPS_CMD = bytes([0x0A, 0x00, 0x04, 0x00, 0x01])
+
+
+def describe_services(client):
+    """把服务表压成一行：`ab5e0001[ab5e0002:w,ab5e0003:n,ab5e0004:n] …`
+
+    为什么要它：「连上了、就绪了、按语音键却没反应」这类问题，第一步必须确认
+    `ab5e0002/3/4` 到底在不在、属性对不对 —— 没有这一行，只能靠猜。
+    属性缩写：r=read w=write W=write-without-response n=notify i=indicate。
+    """
+    short = {"read": "r", "write": "w", "write-without-response": "W",
+             "notify": "n", "indicate": "i", "broadcast": "b"}
+    out = []
+    try:
+        for s in client.services:
+            chars = []
+            for c in s.characteristics:
+                props = "".join(short.get(p, "?") for p in (c.properties or []))
+                chars.append(f"{str(c.uuid).lower()[:8]}:{props}")
+            out.append(f"{str(s.uuid).lower()[:8]}[{','.join(chars)}]")
+    except Exception as e:
+        return f"（枚举失败 {type(e).__name__}: {e}）"
+    return " ".join(out) or "（空）"
+
 SR_IN, SR_OUT = 16000, 48000
 
 
@@ -862,6 +887,9 @@ class VoiceRole(threading.Thread):
         self._ctl = None                    # ATVV 控制特征（补发 GET_CAPS 用）
         self._caps_at = 0.0                 # 上次发 GET_CAPS 的时间（限流）
         self._last_press_frames = None      # 上一段按住收到的音频帧数
+        self._ctrl_seen = 0                 # 控制特征回话条数（诊断用）
+        self._ctl_resp = False              # GET_CAPS 该用带响应写还是无响应写
+        self._awake_at = 0.0                # 本次会话建立时刻
 
     # ---------- 对外 ----------
     def poke(self):
@@ -875,6 +903,23 @@ class VoiceRole(threading.Thread):
         """
         self._activity_at = time.time()
         self._poke.set()
+
+    def _hid_gate_state(self):
+        """把 `hid_probe()` 归一成三态：`ok` / `reconnecting` / `absent`。
+
+        兼容两种回调：老式返回 True/False 的、和新式返回三态字符串的
+        （app._hid_state）。老式 True 当 `ok`、False 当 `absent`。
+        """
+        fn = self.hid_probe
+        if fn is None:
+            return "absent"
+        try:
+            st = fn()
+        except Exception:
+            return "absent"
+        if st in ("ok", "reconnecting", "absent"):
+            return st
+        return "ok" if st else "absent"
 
     async def _wait_hid_awake(self):
         """守门：系统 HID 握着链路、而遥控器在睡 —— 这时**绝不去建链**。
@@ -890,22 +935,35 @@ class VoiceRole(threading.Thread):
             留一条半开连接在蓝牙栈里，Windows 的 HID 再也握不上那条链路 ——
             于是"按语音键没反应"过几分钟就变成"连方向键都不动了"。
 
-        所以：只要 `hid_probe()` 说 HID 在，语音就只在「按键活动后 20 秒内」尝试；
-        其余时间**安静等着**（不刷日志、不占链路）。用户按任意键（包括语音键）
-        就会叫醒这里 —— 那本来也是唯一能连上的时机。
+        三态处理：
+
+          · `absent`        —— 没走本地直读，没有"抢链"这回事，语音自己连（老行为）；
+          · `reconnecting`  —— **一步都不许动**。换电池 / 重新配对之后 Windows 要重建
+                               HID 子设备，链路会"连上又断"好几轮；这时插进去建链，
+                              会让重建过程无限拉长（蓝牙里看着"连上就断"就是这个）；
+          · `ok`            —— 只在「按键活动后 20 秒内」尝试，其余时间安静等着。
         """
         if self.hid_probe is None:
             return
         waited = 0.0
         while not self.stop_flag.is_set():
-            try:
-                hid_ok = bool(self.hid_probe())
-            except Exception:
-                hid_ok = False
-            if not hid_ok:
-                # HID 没握着链路（设备不在 / 走了 frida 旁路）→ 没有"抢链"这回事，
-                # 退回老行为：语音自己连。
+            st = self._hid_gate_state()
+            if st == "absent":
                 return
+            if st == "reconnecting":
+                # 让开重建过程，并把按键窗口作废 —— 否则刚重建完就会用旧窗口硬连
+                self._activity_at = 0.0
+                now = time.time()
+                if now - self._gate_logged >= 30.0:
+                    self._gate_logged = now
+                    self._log("语音：系统 HID 正在重建（遥控器刚换了电池 / 重新配对？）"
+                              "—— 先不碰链路，等它稳定")
+                    self.note = i18n.L("等 HID 稳定（遥控器正在重连）",
+                                       "Waiting for the HID link to settle")
+                    self._emit("status", {"connected": False, "note": self.note})
+                await asyncio.sleep(0.5)
+                waited += 0.5
+                continue
             if time.time() - self._activity_at <= HID_AWAKE_WINDOW_S:
                 if waited >= 1.0:
                     self._log(f"语音：系统 HID 已握住链路（等了 {waited:.0f} 秒）"
@@ -1397,6 +1455,8 @@ class VoiceRole(threading.Thread):
 
         loop = asyncio.get_running_loop()
         last_frame = [0.0]
+        self._awake_at = time.time()        # 本次会话建立时刻（静默看门狗用）
+        self._ctrl_seen = 0
 
         def on_status(_c, data: bytearray):
             b = bytes(data)
@@ -1414,16 +1474,54 @@ class VoiceRole(threading.Thread):
                 except Exception:
                     pass
 
+        def on_ctl(_c, data: bytearray):
+            """控制特征（ab5e0002）的回话 —— 只有它支持 notify 时才会走到这里。
+
+            ⚠ 真机实测这支 A3 的 `ab5e0002` 属性是 **`W`（只支持无响应写）**，
+              既不能读也不能 notify —— 所以 GET_CAPS **没有回话**，别指望它。
+              能力表只能从「按语音键后有没有 0x04」间接确认。
+            """
+            b = bytes(data)
+            if not b:
+                return
+            self._ctrl_seen += 1
+            loop.call_soon_threadsafe(self._log, f"语音：控制响应 {b.hex(' ')}")
+
+        # ★ 服务表打一行：排查「连上了却没声音」时，第一件事是确认
+        #   ab5e0002/3/4 在不在、属性对不对（W=无响应写，w=带响应写，n=notify）。
+        self._log("语音：服务表 " + describe_services(client))
+
+        # 控制通道：只有支持 notify/indicate 才订阅（本机这支不支持，订阅会直接报错）
+        ctl_props = list(getattr(ctl, "properties", []) or [])
+        ctl_notify = False
+        if ctl is not None and ("notify" in ctl_props or "indicate" in ctl_props):
+            try:
+                await client.start_notify(ctl, on_ctl)
+                ctl_notify = True
+            except Exception as e:
+                self._log(f"语音：控制特征订阅不上（{type(e).__name__}: {e}）")
         # 音频订阅必须先于状态订阅，避免丢掉起始帧
         await client.start_notify(audio, on_audio)
         await client.start_notify(status, on_status)
+
+        # 探针一：读一次电量。能读出来就证明这条链路是**双向通的** ——
+        # 「连上了却没声音」时，先排除"其实链路是死的"这一种。
+        self._log("语音：链路自检 —— " + await self._probe_link(client))
+
         if ctl:
+            # ★ 写方式必须跟特征属性一致：ab5e0002 只有 W（无响应写）。
+            #   对 W-only 特征用 response=True，Windows 可能在 ATT 层丢弃，
+            #   而 API 不报错 —— 日志显示"已写入"，遥控器其实什么都没收到。
+            use_resp = "write" in ctl_props and "write-without-response" not in ctl_props
+            self._ctl_resp = use_resp
             try:
-                await client.write_gatt_char(ctl, bytes([0x0A, 0x00, 0x04, 0x00, 0x01]),
-                                             response=False)
+                await client.write_gatt_char(ctl, CAPS_CMD, response=use_resp)
                 self._caps_at = time.time()
+                self._log("语音：GET_CAPS 已写入（"
+                          + ("带响应写" if use_resp else "无响应写，与特征属性一致")
+                          + ("；控制通道可收响应" if ctl_notify else "") + "）")
             except Exception as e:
-                self._log(f"语音：GET_CAPS 发送失败（不影响收流）: {e}")
+                self._log(f"语音：GET_CAPS 写入失败 {type(e).__name__}: {e}")
         # 补发 GET_CAPS 要用到这两样（见 _rearm_caps）
         self._ctl = ctl
         self._last_press_frames = None
@@ -1434,6 +1532,7 @@ class VoiceRole(threading.Thread):
         else:
             self._log(f"语音：✗ 认不出语音键目标 {self.voice_spec} —— 语音键不会发任何键")
         self._log("语音：就绪 —— 按住遥控器【语音键】说话，松开即停")
+        silent = asyncio.ensure_future(self._silent_watch(self.sessions))
 
         disc = asyncio.Event()
 
@@ -1456,9 +1555,61 @@ class VoiceRole(threading.Thread):
             self.connected = False
             self.note = i18n.L("已断开", "Disconnected")
             self.voice.release()
+            silent.cancel()
             await self._close_current()
 
+    async def _silent_watch(self, sessions0, wait=20.0):
+        """连上 wait 秒还没收到任何语音数据 → 提示一句，但别把人吓着。
+
+        为什么值得一条专门的日志：「连上了、就绪了、按语音键却没反应」是最难查的
+        一种 —— 链路、服务、订阅都正常，就是没声音。把它和"链路是死的"分开说，
+        排查时能少走一大圈（真机上一次就卡在这里）。
+
+        ⚠ 措辞刻意保持中性：会话是长连接，用户连上后没马上按语音键是**完全正常**的，
+        这条不该读起来像报错。
+        """
+        await asyncio.sleep(wait)
+        if self.stop_flag.is_set() or not self.connected:
+            return
+        if self.sessions != sessions0:
+            return
+        self._log(f"语音：已连接 {wait:.0f} 秒，还没收到语音数据"
+                  f"（控制响应 {self._ctrl_seen} 条）—— 按一下语音键试试；"
+                  f"按了也没反应的话，先看上面「链路自检」那行能不能读出电量")
+
     # ---------- 语音键事件 ----------
+    async def _probe_link(self, client):
+        """读几个只读特征，证明这条链路**双向通**。
+
+        为什么值得：「连上了、订阅也成功、按语音键却一声不响」时，最怕的其实是
+        链路早就半死 —— Windows 的 GATT 会话可以停在"看起来已连接"的样子。
+        能读出电量，就说明 ATT 层来去都通，问题只在遥控器自己不发 ATVV 事件
+        （那就是固件状态的事，取电池 10 秒）。
+        """
+        def find(prefix):
+            for s in client.services:
+                for c in s.characteristics:
+                    if str(c.uuid).lower().startswith(prefix):
+                        return c
+            return None
+
+        bits = []
+        for prefix, label in (("00002a19", "电量"), ("00002a26", "固件"),
+                              ("00002a24", "型号"), ("00002a29", "厂商")):
+            ch = find(prefix)
+            if ch is None:
+                continue
+            try:
+                raw = bytes(await client.read_gatt_char(ch))
+            except Exception as e:
+                bits.append(f"{label}读不到({type(e).__name__})")
+                continue
+            if prefix == "00002a19" and raw:
+                bits.append(f"电量 {raw[0]}%")
+            else:
+                bits.append(f"{label}=" + raw.decode("utf-8", "replace").strip("\x00")[:24])
+        return "，".join(bits) if bits else "读不到任何只读特征（链路可能半死）"
+
     def _rearm_caps(self, delays=(0.0, 0.30)):
         """补发 GET_CAPS —— 让遥控器重新进录音态。
 
@@ -1487,7 +1638,7 @@ class VoiceRole(threading.Thread):
                     return
                 try:
                     await client.write_gatt_char(
-                        ctl, bytes([0x0A, 0x00, 0x04, 0x00, 0x01]), response=False)
+                        ctl, CAPS_CMD, response=bool(getattr(self, "_ctl_resp", False)))
                     if i == 0:
                         self._log("语音：上一段没收到音频 —— 补发 GET_CAPS"
                                   "（让遥控器重新进录音态）")
