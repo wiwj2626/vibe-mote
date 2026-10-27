@@ -518,7 +518,7 @@ per second that is 1.5 s / 1.6 s / 1.1 s / 2.2 s / 1.8 s, and none was a 0–5 f
 ### 8.8 How to verify
 
 ```bash
-python tests/test_gate.py      # 5 guard rules, no remote needed
+python tests/test_gate.py      # 6 guard rules, no remote needed
 ```
 
 On hardware: restart the client → the log must show `按键映射：本地 HID 直读` **first**, then
@@ -526,6 +526,85 @@ On hardware: restart the client → the log must show `按键映射：本地 HID
 `语音：系统 HID 已握住链路 —— 开始建语音连接` → `语音：已连接遥控器` → **10 services**
 (including `ab5e0001`) → `语音：链路自检 —— 电量 …` → `语音：就绪` → hold the voice key →
 `语音：▼ 开始` / `▲ 结束（本段 60+ 帧）`.
+
+### 8.9 Fix 5: wait for the **encrypted** link before connecting
+
+This one is the hardest to find, and it is why the same key press sometimes works and
+sometimes yields only 5 services.
+
+**Symptom**
+
+```
+语音：缺少 ATVV 特征（本次枚举到 5 个服务：
+      00001800, 00001801, 0000180a, 0000180f, 00001813）
+```
+
+**Diagnostic**: that table does not even contain `00001812` (HID over GATT). A remote that
+legitimately holds a HID link cannot enumerate that table — so this is *not* "we stole the HID
+link", it is a **fresh link that never completed pairing/encryption**. The remote only exposes
+`1812` (HID) and `ab5e` (ATVV) on an encrypted link; unencrypted it hands out only
+1800/1801/180a/180f/1813.
+
+**Controlled observation** (same remote, same PC, same day):
+
+| Time | Delay between key press and connect | Enumeration | Result |
+| --- | --- | --- | --- |
+| 13:16:09 | 15 s (connect timeout + scan) | **10**, incl. `ab5e0001` | 8 voice captures, all good |
+| 13:18:42 | almost immediately | 5, no ATVV | failed |
+| 13:22:34 | almost immediately | 5, no ATVV | failed |
+
+The difference is **timing**: at the instant of a key press, Windows' HID sub-device is still
+negotiating encryption. Whoever connects first decides the encryption state of the link. The old
+line "遥控器有按键活动 —— 不再退避，立刻重试连接" was not a feature here, it was the bug.
+
+**Fix**
+
+```python
+HID_POST_KEY_SETTLE_S  = 2.5   # after a key press, wait for the handshake before connecting
+HID_SETTLE_CAP_S       = 6.0   # but a user mashing the D-pad keeps refreshing the timestamp
+UNPAIRED_RETRY_DELAY_S = 8.0   # after grabbing a bad link, do not retry in place
+```
+
+The third constant matters as much as the first: grab a bad link → drop it and hand it back →
+reconnect "immediately" → grab *another* unencrypted link. That is how three identical bad tables
+appeared in a row. Backing off 8 s lets Windows re-establish properly.
+
+**Once this state is written into the Windows GATT cache it does not heal by itself** — fixed code
+cannot undo it; the device has to be removed and paired again (see §8.7). After doing exactly that,
+13:33:28 produced the full 10-service table:
+
+```
+[13:33:28] 语音：服务表 … ab5e0001[ab5e0002:W,ab5e0003:n,ab5e0004:n] …
+[13:33:30] 语音：链路自检 —— 电量 95%，固件=26.5，型号=A3，厂商=Google Inc.
+[13:33:30] 语音：就绪
+[13:33:42] [按键] 语音 → 按住 RALT   ▼ 开始（第 1 次会话）
+[13:33:45] ▲ 结束（本段 81 帧音频 ≈ 1.3s）
+[13:34:17] [按键] 语音 → 按住 RALT   ▼ 开始（第 2 次会话）
+[13:34:19] ▲ 结束（本段 61 帧音频 ≈ 1.0s）
+```
+
+### 8.10 Two messages that lied (both fixed)
+
+**① "this remote most likely has no voice service"** — the self-check used to say this after three
+consecutive attempts that only saw basic services, steering the user toward "the hardware is
+broken". In reality every occurrence of the §8.9 scenario produced exactly that result. It now
+branches on whether `1812` is present: `1812` present but no `ab5e` is a genuine "no voice";
+no `1812` at all means the pairing/encryption state is gone and the device must be re-paired.
+
+**② "系统 HID 正在重建（遥控器刚换了电池 / 重新配对？）"** — this stayed on screen after every
+restart, before any key was pressed. `_hid_state()` conflated "is the link held?" with "have we
+seen a key report?": the moment the collections open, `local_hid` is `True`, but `ready` only
+flips on the first HID report. It now looks only at `local_hid` plus the `HID_SETTLE_S` (8 s)
+settle window. Returning `ok` is safe — `ok` only permits connecting within 20 s of a key press,
+so with no key press nothing happens; only the wording changes to "press any remote button".
+
+Measured (collections opened at 13:30:31, UI still claimed "rebuilding" at 13:32:05):
+
+```
+[13:30:31] 按键映射：本地 HID 直读（1 个集合…）
+[13:31:08] 语音：系统 HID 正在重建（…）        ← false alarm
+[13:32:05] 界面：等 HID 稳定（遥控器正在重连）   ← false alarm
+```
 
 ---
 
@@ -572,12 +651,16 @@ If it shows `挂上蓝牙驱动宿主 WUDFHost (PID …)`, it waited the full 10
 
 ```
  new: hidlocal.py      | 213
- app.py                | 190 +++++++++++++++----
- keys.py               | 603 ++++++++++++++++++++++++++++++++++++++++++++++++++---
+ keys.py               | 603 +++++++++++++++++++++++++++++++++++++++++++++---
+ voice.py              | 573 ++++++++++++++++++++++++++++++++++++++++---
+ app.py                | 241 ++++++++++++++++++----
+ web/index.html        | 228 +++++++++++++++++++++--
  tap.js                |  19 +-
- voice.py              | 321 +++++++++++++++++++++++++++---
- web/index.html        | 228 ++++++++++++++++++++++--
- 6 files changed, 1476 insertions(+), 98 deletions(-)
+ new: tests/test_gate.py | 142
+
+ 6 files changed, 1778 insertions(+), 99 deletions(-)   (code only)
+ 7 files changed, 1920 insertions(+), 99 deletions(-)   (code + tests)
+12 files changed, 3315 insertions(+), 99 deletions(-)   (incl. docs)
 ```
 
 By feature:
@@ -586,10 +669,11 @@ By feature:
 | --- | --- | --- |
 | `hidlocal.py` | new: SetupAPI enumeration + `ReadFile` | §2 |
 | `keys.py` | `REPORT_TABLES`, `hidlocal` backend, `repeat`, `GestureRouter`, `open_target`, self-check counts local HID, **patient HID retry instead of falling back to frida** | §1 §2 §3 §5 §8.6 |
-| `app.py` | startup order (HID first, then voice), `_wait_keytap_ready`, **three-state `_hid_state` guard**, recommended keymap, `text`+`enter`, recursive `_clean_mapping`, gesture-aware `describe_mapping` | §4 §5 §8 |
-| `voice.py` | link guard `_wait_hid_awake` (three states), `hid_probe`, hand the link back on a 5-service result, **link self-check (battery/firmware/model)**, silent-session watchdog, re-send `GET_CAPS` | §8 |
+| `app.py` | startup order (HID first, then voice), `_wait_keytap_ready`, **three-state `_hid_state` guard (keyed on `local_hid`, not `ready`)**, recommended keymap, `text`+`enter`, recursive `_clean_mapping`, gesture-aware `describe_mapping`, `voice-cmd` / `voice-reconnect` / `voice-rearm` | §4 §5 §8 §8.10 |
+| `voice.py` | link guard `_wait_hid_awake` (three states), `hid_probe`, hand the link back on a 5-service result, **post-key encryption settle**, **8 s backoff after a bad link**, **link self-check (battery/firmware/model)**, silent-session watchdog, re-send `GET_CAPS`, `MIC_CLOSE` reset, all-channel listener, `atvv_cmd` | §8 §8.9 |
 | `tap.js` | accepts `0x01`, fixed nullify offset | §1 (drive-by) |
 | `web/index.html` | gesture tabs, auto-Enter switch, `open` type, `normMapping` no longer drops fields | §5 |
+| `tests/test_gate.py` | new: 6 guard rules (incl. "mashing the D-pad must not stall the settle") | §8.8 |
 
 `tap.js` also got two fixes that apply to every remote (this machine no longer uses it, but other
 machines/drivers still go through frida):
