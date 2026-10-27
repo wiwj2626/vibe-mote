@@ -2,6 +2,32 @@
 
 🌐 **English** | [中文](README.md)
 
+---
+
+> ### 📌 Personal fork (based on upstream v1.1.0)
+>
+> Adaptation patch for the **Chromecast Bluetooth voice remote, A3 model** (`VID_18D1&PID_9450`).
+> On this machine the upstream build had **no button response at all**. Details in
+> **[`PATCHES.en.md`](PATCHES.en.md)** (Chinese: [`补丁说明.md`](补丁说明.md)).
+>
+> **4 files** changed, every hunk marked `★ 本地补丁` (local patch) so it stays mergeable with upstream:
+>
+> | File | Change | Problem solved |
+> |---|---|---|
+> | `hidlocal.py` | **new** | frida's `NtDeviceIoControlFile` hook received **zero reports** on this machine, so we read the HID device directly (`SetupAPI` + `ReadFile`) — no elevation, no frida |
+> | `keys.py` | +229 lines | Upstream's table is `report ID 0x02` + usage `0x0042`; ours is `0x01` + `0x0003` — **no overlap at all** → per-report-ID tables |
+> | `keys.py` | repeat | `hold` relies on keyboard-driver auto-repeat, which **is not** generated for synthesized `SendInput` keydowns → `repeat` flag + software repeat (0.35 s initial delay, then every 0.08 s) |
+> | `keys.py` | new `text` / `open` types | A button can type text (optionally auto-Enter) or open a URL/app |
+> | `app.py` | +44 lines | Web UI understands the new types, preserves `repeat`/`enter` on save, ships a recommended A3 keymap |
+> | `tap.js` | +19 lines | It only matched reports starting with `0x02` and zeroed from offset 0 (wiping the report ID too); now accepts `0x01`/`0x02` and writes from offset 1 |
+>
+> **Voice does not go through HID** — it uses ATVV (`ab5e0001~4`) + IMA ADPCM, which upstream already
+> gets right. But BLE is a **single link**: Windows' HID must grab the connection first and the voice
+> client must reuse that same GATT session, otherwise only 5 services are visible and `ab5e0001` is
+> missing. That trap is documented in the patch notes as well.
+>
+> Upstream: [`Tilkmilk/vibe-mote`](https://github.com/Tilkmilk/vibe-mote) · License as upstream (see [`LICENSE`](LICENSE))
+
 Turn a **Google Chromecast / Google TV Bluetooth remote** into a "push-to-talk + hotkey panel"
 device for Windows: **hold the remote's voice button and talk → remote microphone → virtual audio
 cable → your IME types the text**. 14 buttons are freely remappable —

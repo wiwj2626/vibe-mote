@@ -43,15 +43,23 @@ function toHex(ptr, len) {
   return s;
 }
 
-/* 若这份报告是「已被映射的键」，把 usage 两字节写 0，抹掉原生动作。 */
+/* 若这份报告是「已被映射的键」，把 usage 两字节写 0，抹掉原生动作。
+ *
+ * ★ 本地补丁（2026-10-27）：
+ *   1. 原来只看 b[0]===0x02，但 A3 / CR PVT 这款遥控器发的是 0x01，
+ *      于是清位一次都没生效（却又在界面上显示"已屏蔽 N 个键"）。
+ *      现在 0x01 / 0x02 都认。
+ *   2. 原来 writeByteArray 从 ptr 起点写 2 字节 = 把 **report ID 和 usage_lo**
+ *      清零，usage_hi 还在，等于把报文写坏。正确做法是从 offset 1 写，
+ *      只清 usage 那两个字节。 */
 function nullify(ptr, len) {
   if (ptr.isNull() || len !== 3) return;
   try {
     const b = new Uint8Array(ptr.readByteArray(3));
-    if (b[0] !== 0x02) return;                 // 不是遥控器那份报告
+    if (b[0] !== 0x01 && b[0] !== 0x02) return;   // 不是遥控器那份报告
     const usage = b[1] | (b[2] << 8);
     if (!usage || !blockUsages[usage]) return;
-    ptr.writeByteArray([0x00, 0x00]);          // usage_lo / usage_hi = 0
+    ptr.add(1).writeByteArray([0x00, 0x00]);      // usage_lo / usage_hi = 0
     blockCount++;
   } catch (e) {
     /* 写失败就算了：最坏情况是原生动作也会发生一次 */
@@ -90,11 +98,12 @@ if (target === null) {
       this.cap = false;
       const n = this.outLen;
       lens[n] = (lens[n] || 0) + 1;
-      // 3 字节且首字节是 0x02 的，把它的 usage 记进"见过哪些键"（含没被映射的）
+      // 3 字节且首字节是 0x01 / 0x02 的，把它的 usage 记进"见过哪些键"（含没被映射的）
+      // ★ 本地补丁：原来只记 0x02，A3 款（0x01）的按键永远进不了这张表，换遥控器时无从认人。
       if (n === 3 && !this.out.isNull()) {
         try {
           const b3 = new Uint8Array(this.out.readByteArray(3));
-          if (b3[0] === 0x02) {
+          if (b3[0] === 0x01 || b3[0] === 0x02) {
             const u = b3[1] | (b3[2] << 8);
             if (u) seen[u] = (seen[u] || 0) + 1;
           } else if (Object.keys(weird).length < 6) {

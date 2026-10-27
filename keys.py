@@ -22,12 +22,15 @@ from __future__ import annotations
 
 import ctypes
 import os
+import subprocess
 import threading
 import time
 import winreg
 from ctypes import wintypes
 
 import i18n
+
+CREATE_NO_WINDOW = 0x08000000
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 TAP_JS = os.path.join(HERE, "tap.js")
@@ -107,6 +110,35 @@ USAGE_TO_KEY = {
     0x0077: "youtube", 0x0078: "netflix",
 }
 KEY_TO_USAGE = {v: k for k, v in USAGE_TO_KEY.items()}
+
+# ---------------------------------------------------------------------------
+# ★ 本地补丁（2026-10-27）：Chromecast Remote「A3」/CR PVT 这一款的报文格式
+#
+# 上面那张表是按 report ID 0x02、usage 0x0042=上 这类标准 Consumer 用法写的，
+# 但实测这台机器上的遥控器（Google A3，固件 26.5）发的是：
+#
+#     01 03 00      ← report ID 0x01，usage = 0x0003      上
+#     01 04 00      下        01 05 00 左      01 06 00 右
+#     01 07 00      确定      01 0A 00 首页    01 0B 00 返回
+#     01 0E 00      YouTube   01 0F 00 Netflix
+#
+# 两套 usage 完全不重叠，所以原表一个键都命中不了（表现：钩子挂上了、
+# 界面显示「运行中」、按遥控器毫无反应）。语音键同理不走 HID，走 ATVV
+# ab5e0004，这里补不了。
+#
+# 按 report ID 分开查表，避免和别的蓝牙键鼠（0x02 那套）互相污染。
+# ---------------------------------------------------------------------------
+USAGE_TO_KEY_RC01 = {
+    0x0003: "up", 0x0004: "down", 0x0005: "left", 0x0006: "right",
+    0x0007: "ok", 0x000A: "home", 0x000B: "back",
+    0x000E: "youtube", 0x000F: "netflix",
+}
+# 已知的 report ID -> 查表。没列到的按 0x02 那套处理（保持原行为）。
+REPORT_TABLES = {0x01: USAGE_TO_KEY_RC01, 0x02: USAGE_TO_KEY}
+
+
+def usage_table_for(report_id):
+    return REPORT_TABLES.get(report_id, USAGE_TO_KEY)
 
 # ============================================================ SendInput
 KEYEVENTF_KEYUP = 0x0002
@@ -222,6 +254,30 @@ MOUSE_RELEASE = {"left": "left_up", "right": "right_up", "middle": "middle_up"}
 MOUSE_REPEAT = ("wheel_up", "wheel_down")
 REPEAT_INITIAL = 0.30        # 按住多久后开始连发（秒）
 REPEAT_INTERVAL = 0.07       # 连发间隔（秒），约 14 次/秒
+# ★ 本地补丁：键盘连发（方向键按住连续走）的节奏。跟遥控器按键桥保持一致 ——
+#   那套在真机上验证过"一格一格走"的手感，间隔太快会过头、太慢会顿。
+REPEAT_INITIAL_K = 0.35
+REPEAT_INTERVAL_K = 0.08
+
+
+def open_target(target):
+    """★ 本地补丁：打开网址 / 程序（映射类型 "open"）。
+
+    遥控器按 Netflix 就直接开 netflix.com，不用再挂一个外部按键桥。
+    os.startfile 走的是"双击"那条路（默认浏览器），不会闪黑窗。
+    """
+    target = str(target or "").strip()
+    if not target:
+        return False
+    try:
+        if "://" in target or target.lower().endswith((".exe", ".lnk", ".bat", ".cmd")):
+            os.startfile(target)                       # type: ignore[attr-defined]
+        else:
+            subprocess.Popen(["cmd", "/c", "start", "", target],
+                             creationflags=CREATE_NO_WINDOW)
+        return True
+    except Exception:
+        return False
 
 
 def mouse_action(name):
@@ -254,6 +310,7 @@ class Player:
         self.held = None          # 当前 hold 住的键盘键：(mods, vk) 或 None
         self.held_mouse = None    # 当前按住的鼠标键名（left/right/middle）或 None
         self._rep_stop = None     # 滚轮连发的停止信号
+        self._key_rep = None      # ★ 本地补丁：键盘连发的停止信号
 
     def _tap(self, mods, vk):
         if mods:
@@ -278,6 +335,35 @@ class Player:
         if mods:
             mods_up(mods)
         self.held = None
+
+    # ---------------------------------------------------------- 键盘连发
+    # ★ 本地补丁（2026-10-27）：按住遥控器方向键要能连续走。
+    #
+    # 为什么不能只靠 hold：Windows 的按键自动重复是**键盘驱动**按"物理键一直按着"
+    # 生成的，SendInput 合成的 keydown 不会触发它 —— 所以 hold 到最后只走一格。
+    # （实测：vibe-mote 上游就是 hold，按一下动一步、按住不动。）
+    #
+    # 做法跟遥控器按键桥一致：立刻"点"一下给反馈，然后按固定间隔继续"点"。
+    # 用点击而不是重复 keydown，是因为部分程序/输入框只认完整的 down+up。
+    def _key_repeat_stop(self):
+        stop = getattr(self, "_key_rep", None)
+        if stop is not None:
+            stop.set()
+            self._key_rep = None
+
+    def _key_repeat_start(self, mods, vk):
+        self._key_repeat_stop()
+        self._tap(mods, vk)                     # 第一下：按下去立刻有反馈
+        stop = threading.Event()
+        self._key_rep = stop
+
+        def loop():
+            if stop.wait(REPEAT_INITIAL_K):     # 轻点只走一格，按住才连发
+                return
+            while not stop.wait(REPEAT_INTERVAL_K):
+                self._tap(mods, vk)
+
+        threading.Thread(target=loop, daemon=True, name="keyrepeat").start()
 
     # ---------------------------------------------------------- 按住鼠标
     def _mouse_repeat_stop(self):
@@ -322,11 +408,21 @@ class Player:
         if t == "holdmouse":
             self._holdmouse_start(value)
             return
+        if t == "open":                     # ★ 本地补丁：遥控器键直接打开网址/程序
+            open_target(value or str(m.get("text") or ""))
+            return
         if t == "text":
             send_text(str(m.get("text") or ""))
+            # ★ 本地补丁：打完顺手回车（"发一段固定文本然后直接发送"）
+            if m.get("enter"):
+                _send([_kb(0x0D, scan=0x1C), _kb(0x0D, up=True, scan=0x1C)])
             return
         vk = vk_of(value)
         if not vk:
+            return
+        # ★ 本地补丁：带 repeat 的映射 = 按住连续触发（方向键要"一直走"）
+        if m.get("repeat"):
+            self._key_repeat_start(mods if t in ("combo", "holdcombo") else [], vk)
             return
         if t in ("hold", "holdcombo"):
             self._hold_start(mods if t == "holdcombo" else [], vk)
@@ -335,12 +431,15 @@ class Player:
 
     def up(self, m):
         t = m.get("type")
+        if m.get("repeat"):
+            self._key_repeat_stop()          # ★ 先停连发，再处理按住状态
         if t in ("hold", "holdcombo"):
             self._hold_stop()
         elif t == "holdmouse":
             self._holdmouse_stop()
 
     def release_all(self):
+        self._key_repeat_stop()
         self._hold_stop()
         self._holdmouse_stop()
 
@@ -523,10 +622,17 @@ class KeyTap(threading.Thread):
         self._push_block()
 
     def _push_block(self):
-        """把「已被映射的键」的 usage 下发给钩子做清位。"""
+        """把「已被映射的键」的 usage 下发给钩子做清位。
+
+        ★ 本地补丁：要跨**所有**报文格式表收集。原来只用 KEY_TO_USAGE
+        （标准表 0x02 那套的反查），A3/CR PVT 款的 0x03~0x0F 会被漏掉，
+        结果「界面显示已屏蔽 N 个键」但实际一个都没屏蔽。
+        """
         with self._lock:
-            usages = sorted({KEY_TO_USAGE[k] for k in self.mapping
-                             if k in KEY_TO_USAGE})
+            usages = sorted({u
+                             for table in REPORT_TABLES.values()
+                             for u, kid in table.items()
+                             if kid in self.mapping})
         self.blocked_usages = usages
         if self._script:
             try:
@@ -543,8 +649,97 @@ class KeyTap(threading.Thread):
     def _log(self, msg):
         self._emit("log", msg)
 
+    # ---------- 本地 HID 直读后端（本地补丁，优先于 frida） ----------
+    def _local_ids(self):
+        v, p = (self.vidpid or ("18D1", "9450"))
+        try:
+            return int(str(v), 16), int(str(p), 16)
+        except (TypeError, ValueError):
+            return 0x18D1, 0x9450
+
+    def _run_local_hid(self):
+        """能直接读到 HID 报告就用这条路，返回 True 表示"本进程由它负责到停止"。
+
+        为什么优先：
+          · 不需要 frida、不需要往系统进程注入、不注册 frida-* 临时服务、不弹 UAC
+          · 上游那条路依赖 WUDFHost 读 IOCTL 0x80018483，本机实测一次都不触发
+        代价：没有"清位"能力（抹掉原生动作）。这支遥控器的 0x03~0x0F 在 Windows 上
+        没有原生动作，所以不存在双发。
+        """
+        try:
+            import hidlocal
+        except Exception as e:  # noqa: BLE001
+            self._log(f"按键映射：本地 HID 模块不可用（{type(e).__name__}: {e}），改用 frida")
+            return False
+
+        vid, pid = self._local_ids()
+        cols = hidlocal.open_collections(vid, pid)
+        if not cols:
+            self._log("按键映射：本地没找到遥控器的 Consumer 集合，改用 frida 旁路")
+            return False
+
+        self._log(f"按键映射：本地 HID 直读（{len(cols)} 个集合，"
+                  f"VID_{vid:04X}&PID_{pid:04X}，不经 frida、不需要提权）")
+        self.note = i18n.L("运行中（本地 HID 直读）", "Running (local HID)")
+        self._attached_pid = os.getpid()          # 自检里显示"挂在哪个宿主"用
+
+        def on_bytes(payload):
+            self._on_report(hidlocal.to_report_hex(payload))
+
+        backoff = 1.0
+        while not self.stop_flag.is_set():
+            stop = threading.Event()
+            threads = []
+            for _page, handle, _len in cols:
+                t = threading.Thread(target=hidlocal.read_loop,
+                                     args=(handle, on_bytes, stop), daemon=True,
+                                     name="hidlocal")
+                t.start()
+                threads.append(t)
+            self.ready = True
+            self.last_seen = time.time()
+            self._emit("status", {"ready": True, "note": self.note})
+
+            while (not self.stop_flag.is_set()
+                   and threads and all(t.is_alive() for t in threads)):
+                time.sleep(0.2)
+
+            stop.set()
+            hidlocal.close_collections(cols)
+            self.ready = False
+            if self.stop_flag.is_set():
+                break
+
+            # 句柄失效 = 设备被重新枚举（重新配对 / 蓝牙断开 / 驱动重载）。
+            # 必须重开，否则就是"进程活着、一个报文都收不到"——按键桥踩过这个坑。
+            self._log("按键映射：HID 读数中断（设备被重新枚举？），准备重开")
+            with self._lock:
+                self._held.clear()
+            time.sleep(backoff)
+            cols = hidlocal.open_collections(vid, pid)
+            if not cols:
+                backoff = min(backoff * 2, 10.0)
+                self.note = i18n.L("HID 设备暂时不在了（等遥控器重连）",
+                                   "HID device is gone (waiting for the remote)")
+                self._emit("status", {"ready": False, "note": self.note})
+                time.sleep(2.0)
+                cols = hidlocal.open_collections(vid, pid)
+                if not cols:
+                    self._log("按键映射：重新打开失败，退回 frida 旁路")
+                    return False
+            backoff = 1.0
+            self._emit("status", {"ready": True, "note": self.note})
+        self.ready = False
+        return True
+
     # ---------- 主循环 ----------
     def run(self):
+        # ★ 本地补丁：先试「本地 HID 直读」，成功就完全不碰 frida。
+        #   原因见 hidlocal.py 的文件头：这台机器上 WUDFHost 的读 IOCTL 从来没被调用过，
+        #   上游那条 frida 旁路是空的（自检显示「遥控器读 0 次」）。
+        if self._run_local_hid():
+            return
+
         try:
             import frida
         except ImportError:
@@ -744,6 +939,11 @@ class KeyTap(threading.Thread):
                 except (TypeError, ValueError):
                     continue
                 name = USAGE_TO_KEY.get(code)
+                if not name:                       # ★ 本地补丁：也查 rc01 那张表
+                    for _t in REPORT_TABLES.values():
+                        if code in _t:
+                            name = _t[code]
+                            break
                 items.append(f"{name or '未知'}(0x{code:04X})×{n}")
             if items:
                 extra += " 已见按键：" + "、".join(items)
@@ -797,7 +997,7 @@ class KeyTap(threading.Thread):
             self._log(f"按键映射：{payload.get('message')}")
 
     def _on_report(self, raw):
-        """raw 形如 '02 42 00'。"""
+        """raw 形如 '02 42 00'（标准款）或 '01 03 00'（A3 / CR PVT 款）。"""
         self.last_seen = time.time()
         if self.on_activity:
             try:
@@ -811,17 +1011,20 @@ class KeyTap(threading.Thread):
             b = [int(x, 16) for x in parts]
         except ValueError:
             return
+        # ★ 本地补丁：report ID 决定查哪张表。两套 usage 完全不重叠，混查会互相污染。
+        table = usage_table_for(b[0])
         usage = b[1] | (b[2] << 8)
+        hkey = (b[0], usage)
         self.reports += 1
 
         if usage == 0:                  # 空闲帧 = 全部松开
-            for u in list(self._held):
-                self._release(u)
+            for h in list(self._held):
+                self._release(*h)
             return
-        if usage in self._held:
-            return                      # 长按连发：只认第一下
-        self._held.add(usage)
-        kid = USAGE_TO_KEY.get(usage)
+        if hkey in self._held:
+            return                      # 长按连发：只认第一下（按住不放由系统自动重复）
+        self._held.add(hkey)
+        kid = table.get(usage)
         if not kid:
             return
         self._emit("key", {"id": kid, "down": True})
@@ -832,9 +1035,9 @@ class KeyTap(threading.Thread):
             except Exception as e:
                 self._log(f"按键映射：执行 {kid} 失败 {type(e).__name__}: {e}")
 
-    def _release(self, usage):
-        self._held.discard(usage)
-        kid = USAGE_TO_KEY.get(usage)
+    def _release(self, report_id, usage):
+        self._held.discard((report_id, usage))
+        kid = usage_table_for(report_id).get(usage)
         if not kid:
             return
         self._emit("key", {"id": kid, "down": False})

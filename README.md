@@ -2,6 +2,30 @@
 
 > 🌐 **中文** | [English](README.en.md)
 
+---
+
+> ### 📌 这是个人 fork（基于上游 v1.1.0）
+>
+> 针对 **Chromecast 蓝牙语音遥控器 A3 款**（`VID_18D1&PID_9450`）做的适配补丁，
+> 上游版本在这台机器上**按键全无反应**，问题与修复见 **[`补丁说明.md`](补丁说明.md)**（英文 [`PATCHES.en.md`](PATCHES.en.md)）。
+>
+> 改了 **4 个文件**，全部带 `★ 本地补丁` 注释标记，方便日后跟上游合并：
+>
+> | 文件 | 改动 | 解决什么 |
+> |---|---|---|
+> | `hidlocal.py` | **新增** | frida 钩 `NtDeviceIoControlFile` 在本机**一次都收不到报文**，改为直接读 HID 设备（`SetupAPI` + `ReadFile`），不需提权、不碰 frida |
+> | `keys.py` | +229 行 | 上游键码表是 `report ID 0x02` + usage `0x0042`，本机是 `0x01` + `0x0003`，**完全不重叠** → 按 report ID 分表 |
+> | `keys.py` | 连发 | `hold` 依赖键盘驱动的自动重复，`SendInput` 合成的 keydown **不会**触发重复 → 加 `repeat` 标记 + 软件连发（0.35s 后每 0.08s 一次） |
+> | `keys.py` | 新增 `text` / `open` 类型 | 按键发一段文本（可自动回车提交）、按键开网址或程序 |
+> | `app.py` | +44 行 | 网页界面认识新类型、保存时保留 `repeat`/`enter` 标记、给 A3 一套推荐键位 |
+> | `tap.js` | +19 行 | 原来只清 `0x02` 开头的报文的 usage、还把 report ID 一起清零；改为 `0x01`/`0x02` 都认，从偏移 1 开始写 |
+>
+> **语音不在 HID 通道里**，走的 ATVV（`ab5e0001~4`）+ IMA ADPCM，这部分上游本来就是对的；
+> 但 BLE 是**单链路**，必须让 Windows 的 HID 先握住连接、语音客户端再复用同一个 GATT 会话，
+> 否则只能看到 5 个服务、看不到 `ab5e0001`。这条踩坑记录也写在补丁说明里。
+>
+> 上游项目：[`Tilkmilk/vibe-mote`](https://github.com/Tilkmilk/vibe-mote) · 许可证同上游（见 [`LICENSE`](LICENSE)）
+
 把 **Google Chromecast / Google TV 蓝牙遥控器**变成 Windows 上的"说话 + 快捷键"设备：
 **按住遥控器说话 → 遥控器麦克风 → 虚拟声卡 → 输入法出字**；14 个按键随便映射，
 **上下=滚轮、左右=切会话、YouTube / NETFLIX = 审批的「同意 / 拒绝」**。

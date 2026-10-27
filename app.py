@@ -69,22 +69,26 @@ DEFAULT_PORT = 8787
 CREATE_NO_WINDOW = 0x08000000
 
 RECOMMENDED = {
+    # ★ 本地补丁（2026-10-27）：默认映射改成「Chromecast Remote A3 / CR PVT」实测键位。
+    #   原默认是浏览/媒体那套（上/下=滚轮、左/右=Ctrl+Shift+[ ]），对方向键是错的。
     "ok":      {"type": "key",    "value": "ENTER",     "mods": [], "text": ""},
     "back":    {"type": "key",    "value": "ESC",       "mods": [], "text": ""},
-    # 上/下 = 滚轮，而且是**按住不放连续滚**：轻点滚一格、按住一直滚。
-    # 出厂默认就是这个（用户要的行为），"按一下只滚一格"反而是不好用的那个。
-    "up":      {"type": "holdmouse", "value": "wheel_up",  "mods": [], "text": ""},
-    "down":    {"type": "holdmouse", "value": "wheel_down", "mods": [], "text": ""},
-    "left":    {"type": "combo",  "value": "LBRACKET",  "mods": ["CTRL", "SHIFT"], "text": ""},
-    "right":   {"type": "combo",  "value": "RBRACKET",  "mods": ["CTRL", "SHIFT"], "text": ""},
-    "home":    {"type": "combo",  "value": "A",         "mods": ["CTRL", "ALT"], "text": ""},
+    "home":    {"type": "key",    "value": "LWIN",      "mods": [], "text": ""},
+    # 方向键用 hold：按下就一直按着，长按由 Windows 自己的按键重复接管，
+    # 比在 Python 里定时重发更跟手，也不会跟系统重复叠成两倍速。
+    "up":      {"type": "hold",   "value": "UP",        "mods": [], "text": "", "repeat": True},
+    "down":    {"type": "hold",   "value": "DOWN",      "mods": [], "text": "", "repeat": True},
+    "left":    {"type": "hold",   "value": "LEFT",      "mods": [], "text": "", "repeat": True},
+    "right":   {"type": "hold",   "value": "RIGHT",     "mods": [], "text": "", "repeat": True},
+    # open：直接打开网址，不用外部按键桥
+    "youtube": {"type": "open",   "value": "https://www.youtube.com", "mods": [], "text": ""},
+    "netflix": {"type": "open",   "value": "https://www.netflix.com", "mods": [], "text": ""},
+    # 下面这几个键这支遥控器不发报文（音量/电源走红外），留着是为了别的型号能直接用
     "power":   {"type": "combo",  "value": "N",         "mods": ["CTRL"], "text": ""},
     "input":   {"type": "combo",  "value": "P",         "mods": ["CTRL"], "text": ""},
-    "youtube": {"type": "combo",  "value": "BACKQUOTE", "mods": ["CTRL"], "text": ""},
-    "mute":    {"type": "combo",  "value": "J",         "mods": ["CTRL"], "text": ""},
-    "netflix": {"type": "combo",  "value": "R",         "mods": ["CTRL"], "text": ""},
-    "volup":   {"type": "combo",  "value": "EQUAL",     "mods": ["CTRL"], "text": ""},
-    "voldown": {"type": "combo",  "value": "MINUS",     "mods": ["CTRL"], "text": ""},
+    "mute":    {"type": "key",    "value": "VOLUME_MUTE", "mods": [], "text": ""},
+    "volup":   {"type": "key",    "value": "VOLUME_UP",   "mods": [], "text": ""},
+    "voldown": {"type": "key",    "value": "VOLUME_DOWN", "mods": [], "text": ""},
 }
 DEFAULT_CONFIG = {
     "_comment": "遥控器客户端配置。以后端这份为准；界面改完点保存会写回这里。",
@@ -95,7 +99,7 @@ DEFAULT_CONFIG = {
     "audio": {"gain": 4.0, "agc": True, "relay": True},
     "keys": RECOMMENDED,
 }
-TYPES = ("key", "hold", "combo", "holdcombo", "mouse", "holdmouse", "text")
+TYPES = ("key", "hold", "combo", "holdcombo", "mouse", "holdmouse", "text", "open")
 
 REMOTE_LABELS = {
     "power": "电源", "input": "输入源", "up": "上", "down": "下",
@@ -117,9 +121,14 @@ def describe_mapping(m):
         tail = "（按住·连续）" if v in ("wheel_up", "wheel_down") else "（按住）"
         return MOUSE_LABELS.get(v, str(v)) + tail
     if t == "text":
-        return f"文本「{str(m.get('text') or '')[:12]}」"
+        return f"文本「{str(m.get('text') or '')[:12]}」" + (
+            "＋回车" if m.get("enter") else "")
+    if t == "open":
+        return "打开 " + str(m.get("value") or m.get("text") or "")[:32]
     mods = "+".join(m.get("mods") or [])
     name = (mods + "+" if mods else "") + str(v)
+    if m.get("repeat"):
+        return name + "（按住·连发）"
     return name + ("（按住）" if t in ("hold", "holdcombo") else "")
 
 
@@ -313,6 +322,13 @@ def save_config(cfg):
         keys_map[k] = {"type": m["type"], "value": m["value"],
                        "mods": [str(x).upper() for x in (m.get("mods") or [])],
                        "text": str(m.get("text") or "")}
+        # ★ 本地补丁：text 类型可以带一个 enter 标记 —— 打完文本顺手回车
+        #   （"发一段固定文本然后直接发送"）。不保留它的话，界面一保存就被抹掉。
+        if m["type"] == "text" and m.get("enter"):
+            keys_map[k]["enter"] = True
+        # ★ 本地补丁：repeat —— 按住连续触发（方向键要"一直走"）
+        if m.get("repeat"):
+            keys_map[k]["repeat"] = True
     clean["keys"] = keys_map
     if voice_alias:
         clean["voice"] = voice_alias
