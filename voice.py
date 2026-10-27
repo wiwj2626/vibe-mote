@@ -962,6 +962,9 @@ class VoiceRole(threading.Thread):
         self._ctl_resp = False              # GET_CAPS 该用带响应写还是无响应写
         self._awake_at = 0.0                # 本次会话建立时刻
         self._mic_reset_at = 0.0            # 上次发 MIC_CLOSE 的时间（限流）
+        self._voice_held = False            # 逻辑上"语音键正被按住"（IME 热键处于按下态）
+        self._voice_reheld = False          # 已被「20 秒固件硬掐」自动续录过一次
+        self._press_time = 0.0             # 最近一次 0x04 按下的时刻（判断 20 秒超时用）
 
     # ---------- 对外 ----------
     def poke(self):
@@ -1120,24 +1123,34 @@ class VoiceRole(threading.Thread):
         """
         self._rearm_caps(min_gap=0.0, reason="manual")
 
-    def _start_extend_keepalive(self, every=20.0):
-        """录音期间每 20 秒发一次 `0E <sid>`（会话保活）。
+    def _start_extend_keepalive(self, every=8.0, first=8.0):
+        """录音期间持续发 `0E <sid>`（会话保活）—— **提前且频繁**地发。
 
-        参考实现里这是**内部协议维护**、不做成用户选项（EXTEND_SECONDS = 20.0）：
-        遥控器的录音会话是有寿命的，主机不续命就会过期；而会话一旦过期/挂起，
-        遥控器就再也不接受新的开麦请求 —— 这正是「按红外键之后语音永久失效」
-        最说得通的机制。我们以前从来不发，等于一直在让会话自然过期。
+        为什么改节奏（2026-10-27 实测根因）：
+          原来 `time.sleep(20)` 之后再发第一次 —— 而固件会话寿命就是 ~20 秒，
+          第一次保活刚好卡在死线上；更糟的是循环里是"先 sleep 后判断 `_active`"，
+          如果固件在 20 秒整发了 `0x00` 把 `_active` 置否，这次保活就彻底没发出去，
+          于是会话必然在 20 秒被掐，表现就是"按住语音键不到 20 秒输入法就停"。
+
+          参考实现（chromecast_voice.py）靠「遥控器持续送音频」给固件计时器续命，
+          所以它在 20 秒处续命能成功；本机这支 Google A3 **根本不送音频**，会话
+          只能靠 `0E <sid>` 续，就必须**领先于死线**地发：先等 8 秒发第一次，
+          之后每 8 秒发一次。这样固件看到的「距上次续命」永远 < 10 秒，不会到 20。
+
+        间隔选 8 秒而非 20 秒：既给固件留足余量，又不会被 GATT 写延迟 / 进程调度
+        把续命包顶到 20 秒死线上。
         """
         def _loop():
+            # 第一次提前发（远在 20 秒死线之前），别先睡满 20 秒。
+            if first and first > 0:
+                time.sleep(first)
             while (not self.stop_flag.is_set()
                     and getattr(self, "_active", False)
                     and self.connected):
-                time.sleep(every)
-                if not getattr(self, "_active", False) or not self.connected:
-                    return
                 cmd = self._mic_extend_cmd()
                 if cmd:
                     self.atvv_cmd(cmd)
+                time.sleep(every)
         try:
             t = threading.Thread(target=_loop, daemon=True)
             t.start()
@@ -2259,6 +2272,24 @@ class VoiceRole(threading.Thread):
         if op == 0x04 and len(b) >= 4:
             self._last_session_id = b[3]
 
+        # ── 0x04 重新进入（处于"被固件 20 秒硬掐后自动续录"态时）─────────────
+        #   自动续录把 IME 热键一直按着；万一用户在固件某次掐断后真的又按了一下语音键，
+        #   这里先把上一轮还按着的 IME 热键和会话清干净，再当一次全新按下处理，
+        #   避免"叠两层按下"或卡在续录态出不去。
+        if op == 0x04 and active and getattr(self, "_voice_reheld", False):
+            try:
+                self.voice.release()
+            except Exception:
+                pass
+            try:
+                self.atvv_cmd(self._mic_close_cmd())
+            except Exception:
+                pass
+            self._active = False
+            self._voice_reheld = False
+            self._voice_held = False
+            active = False
+
         if op == 0x04 and not active:
             # 上一段"按了却没音频" → 这次按下时先把录音态补回来（见 _rearm_caps）
             prev = getattr(self, "_last_press_frames", None)
@@ -2273,6 +2304,9 @@ class VoiceRole(threading.Thread):
             self._start_extend_keepalive()
             self.sessions += 1
             self._session_frames = 0
+            self._voice_held = True
+            self._voice_reheld = False
+            self._press_time = time.time()
             self._emit("key", {"id": "voice", "down": True})
             self._log(f"语音：▼ 开始（第 {self.sessions} 次会话）")
             if self.voice.mode == "tap":
@@ -2280,9 +2314,32 @@ class VoiceRole(threading.Thread):
             else:
                 self.voice.press()
         elif b[0] == 0x00 and active:
+            now = time.time()
+            elapsed = now - getattr(self, "_press_time", 0.0)
+            # ★ 固件在 ~20 秒强行掐断（本机 A3 不送音频、只认 0E 续命，且老节奏把保活
+            #   卡在死线上）：这是"假结束"。只要距按下约 20 秒、且还没续录过，就自动
+            #   重开会话并继续按住 IME —— 多数情况下配合修正后的保活节奏能续住；即便
+            #   固件仍硬掐，这次重开也只再续 ~20 秒，下一轮 0x00 会走到正常释放，不会卡死。
+            #   用 18~23 秒这个窄窗口区分"固件掐断"和"用户真的松手"（用户极少恰好
+            #   在 20 秒整松手），避免把一次正常短按误判成掐断而卡住输入法。
+            premature = (getattr(self, "_voice_held", False)
+                         and not getattr(self, "_voice_reheld", False)
+                         and 18.0 <= elapsed <= 23.0)
+            if premature:
+                self._voice_reheld = True
+                self._press_time = now
+                try:
+                    self.atvv_cmd(MIC_OPEN_CMD)
+                except Exception:
+                    pass
+                self._log("语音：⚠ 会话约 20 秒被固件掐断（A3 固件不送音频、只认 0E 续命）"
+                          "—— 已自动重开并继续录音；若你已松开语音键，请再按一下让它彻底结束")
+                return
             self._active = False
             self._emit("key", {"id": "voice", "down": False})
             self.voice.release()
+            self._voice_held = False
+            self._voice_reheld = False
             n = self._session_frames
             self._last_press_frames = n
             # ★ 松开时显式关麦（同样对齐参考实现），下一段按下前状态是干净的。
