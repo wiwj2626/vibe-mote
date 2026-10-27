@@ -1441,9 +1441,28 @@ class VoiceRole(threading.Thread):
         每次新连接都会被当成第二个客户端 —— 重连治不好，只有换进程才行。
         """
         c, self._client = self._client, None
-        self._ctl = None
         if c is None:
+            self._ctl = None
             return
+        # ★★ 断开前**先发 MIC_CLOSE**（2026-10-27 14:11 血泪）。
+        #   遥控器如果以为"麦还开着"，而我们这边直接把链路断了，它的状态机就会
+        #   僵死 —— 之后无论重连多少次、换多少个进程，它都不再发 0x04。
+        #   真机实测：14:11:56 一次 force_reconnect（没发 MIC_CLOSE 就断）之后，
+        #   14:16 / 14:21 / 14:31 三次重新建链，遥控器一次 0x04 都没再发过 ——
+        #   而在 14:11 之前它是好的（58 帧、74 帧）。
+        #
+        #   参考实现对这一点非常明确（remotemic-src/RC003，
+        #   ble_transport_winrt.py 的 send_mic_close_threadsafe）：
+        #   "before it ever touches GATT resources (MIC_CLOSE, CCCD,
+        #    characteristic/service/device disposal)" —— 先关麦，再拆资源。
+        #   我们以前是反的：直接 disconnect。
+        try:
+            # ★ 必须在 self._ctl / self._client 还指着旧会话的时候发 —— 发完再清。
+            self.atvv_cmd(MIC_CLOSE_CMD)
+            await asyncio.sleep(0.25)
+        except Exception:
+            pass
+        self._ctl = None
         try:
             await c.disconnect()
         except Exception:
@@ -1762,18 +1781,28 @@ class VoiceRole(threading.Thread):
             #   而 API 不报错 —— 日志显示"已写入"，遥控器其实什么都没收到。
             use_resp = "write" in ctl_props and "write-without-response" not in ctl_props
             self._ctl_resp = use_resp
-            try:
-                await client.write_gatt_char(ctl, CAPS_CMD, response=use_resp)
-                self._caps_at = time.time()
-                # ★ 只报"已写入"会骗人：写操作成功只代表 ATT 层没报错。真正算数的
-                #   是 3 秒内有没有 CAPS 应答（见 _caps_keepalive 里的探活）。
-                self._log("语音：已发 GET_CAPS（v1.0 六字节，" + CAPS_CMD.hex(" ")
-                          + "）—— 等遥控器回能力应答（0x0B）")
-                if not ctl_notify:
-                    self._log("语音：⚠ 控制通道不能收通知 —— 收不到能力应答，"
-                              "探活心跳会一直判失败；这条链多半不是系统 HID 那条")
-            except Exception as e:
-                self._log(f"语音：GET_CAPS 写入失败 {type(e).__name__}: {e}")
+            # ★ 默认**不发** GET_CAPS（2026-10-27）。
+            #   参考实现建链时发一次、然后等 3 秒要应答 —— 本机这台固件**从不回**
+            #   （14:16 / 14:21 / 14:31 三次建链实测都没有 0x0B）。既然对空气喊话，
+            #   唯一的价值只剩"万一它把遥控器搞晕"这个副作用 —— 那是净亏。
+            #   想试的话把 config.json 的 voice.send_caps 设成 true。
+            _want_caps = bool((self.voice_spec or {}).get("send_caps"))
+            if not _want_caps:
+                self._log("语音：跳过 GET_CAPS（这台固件不支持能力协商；"
+                          "需要时可在 config.json 里设 voice.send_caps = true）")
+            else:
+                try:
+                    await client.write_gatt_char(ctl, CAPS_CMD, response=use_resp)
+                    self._caps_at = time.time()
+                    # ★ 只报"已写入"会骗人：写操作成功只代表 ATT 层没报错。真正算数的
+                    #   是 3 秒内有没有 CAPS 应答（见 _caps_keepalive 里的探活）。
+                    self._log("语音：已发 GET_CAPS（v1.0 六字节，" + CAPS_CMD.hex(" ")
+                              + "）—— 等遥控器回能力应答（0x0B）")
+                    if not ctl_notify:
+                        self._log("语音：⚠ 控制通道不能收通知 —— 收不到能力应答，"
+                                  "探活心跳会一直判失败；这条链多半不是系统 HID 那条")
+                except Exception as e:
+                    self._log(f"语音：GET_CAPS 写入失败 {type(e).__name__}: {e}")
         # 补发 GET_CAPS 要用到这两样（见 _rearm_caps）
         self._ctl = ctl
         self._last_press_frames = None
