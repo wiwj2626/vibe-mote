@@ -10,7 +10,7 @@
 > On this machine the upstream build had **no button response at all**. Details in
 > **[`PATCHES.en.md`](PATCHES.en.md)** (Chinese: [`补丁说明.md`](补丁说明.md)).
 >
-> **5 files** changed (`+769 / −67`), every hunk marked `★ 本地补丁` (local patch) so it stays mergeable with upstream:
+> **6 files** changed (`+1237 / −95`) plus one regression test, every hunk marked `★ 本地补丁` (local patch) so it stays mergeable with upstream:
 >
 > | File | Change | Problem solved |
 > |---|---|---|
@@ -19,7 +19,9 @@
 > | `keys.py` | repeat | `hold` relies on keyboard-driver auto-repeat, which **is not** generated for synthesized `SendInput` keydowns → `repeat` flag + software repeat (0.35 s initial delay, then every 0.08 s) |
 > | `keys.py` | new `text` / `open` types | A button can type text (optionally auto-Enter) or open a URL/app |
 > | `keys.py` | **gesture layer** | One key does **single / double / long-press**: `double` / `long` sub-mappings, 300 ms / 550 ms timing (ported from RC003) |
-> | `app.py` | +100 lines | Web UI understands the new types, **recursively** preserves `repeat`/`enter`/`double`/`long`, ships a recommended A3 keymap |
+> | `app.py` | +159 lines | Web UI understands the new types, **recursively** preserves `repeat`/`enter`/`double`/`long`, ships a recommended A3 keymap; **startup order is now HID first, voice second** (upstream does the reverse, so voice grabs the only link and keys die with it) |
+> | `voice.py` | +164 lines | **Link guard**: while Windows HID holds the link, voice only connects inside the 20 s window after a button press, and never touches the link otherwise; re-sends `GET_CAPS` after the remote wakes so the voice key actually produces audio |
+> | `tests/test_gate.py` | **new** | Regression test for the four guard rules — no Bluetooth, no remote needed |
 > | `web/index.html` | +228 lines | Trigger tabs, "Press Enter after typing" switch, editable `open` type; `normMapping()` no longer drops fields |
 > | `tap.js` | +19 lines | It only matched reports starting with `0x02` and zeroed from offset 0 (wiping the report ID too); now accepts `0x01`/`0x02` and writes from offset 1 |
 >
@@ -41,7 +43,9 @@
 > **Voice does not go through HID** — it uses ATVV (`ab5e0001~4`) + IMA ADPCM, which upstream already
 > gets right. But BLE is a **single link**: Windows' HID must grab the connection first and the voice
 > client must reuse that same GATT session, otherwise only 5 services are visible and `ab5e0001` is
-> missing. That trap is documented in the patch notes as well.
+> missing. That trap is documented in the patch notes as well — and **upstream starts the roles in the
+> wrong order** (voice first), so every client restart re-triggers it. This fork starts the HID side
+> first, waits for it to hold the link, and adds a link guard; see patch notes §8.
 >
 > Upstream: [`Tilkmilk/vibe-mote`](https://github.com/Tilkmilk/vibe-mote) · License as upstream (see [`LICENSE`](LICENSE))
 

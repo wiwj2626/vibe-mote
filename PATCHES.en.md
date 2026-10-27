@@ -23,6 +23,8 @@ layer (timing lifted from the RC003 reference implementation).
 | Want "press a key to open a URL" | Keys/mouse only | No such action type | New `open` type (§4) |
 | Want one key to do different things | One mapping per key | Upstream only knows "down" and "up" | **Gesture layer**: `double` / `long` sub-mappings (§5) |
 | Text needs a second OK press to send | Text stops in the input box | Upstream UI has no "auto Enter" switch | UI switch "Press Enter after typing", auto-checked for text (§5.4) |
+| Voice key does nothing, then even the D-pad dies | Log: `缺少 ATVV 特征（枚举到 5 个服务）`, then endless retries | **Startup order inverted**: voice grabs the single BLE link first and its retries also starve the HID stack (§8) | Start HID first and wait for it to hold the link; voice only connects inside a "a key was just pressed" window (§8) |
+| Voice key pressed but no audio, no text | Log: `本段 0~5 帧音频` | `GET_CAPS` is sent only once at connect time; the remote never re-enters recording state after sleeping | Re-send `GET_CAPS` twice on the next press when the previous press was starved (§8.5) |
 
 ---
 
@@ -375,17 +377,120 @@ repeatedly and do not re-pair repeatedly.
 
 ---
 
-## 8. Verification checklist
+## 8. Startup order and the link guard (the most important fix here)
+
+§7 explains that the HID side must grab the link first — yet upstream starts the roles in the
+**opposite** order, so every client restart trips over it again. This section records the full
+cause and the fix.
+
+### 8.1 Symptom: the voice key does nothing, then even the D-pad stops working
+
+```
+[12:29:29] 客户端已启动
+[12:29:29] 语音：连接遥控器 70:4F:10:6D:03:A2 …
+[12:29:29] 按键映射：本地 HID 直读（1 个集合，VID_18D1&PID_9450）
+[12:29:41] 语音：已连接遥控器 70:4F:10:6D:03:A2
+[12:29:41] 语音：缺少 ATVV 特征（本次枚举到 5 个服务：1800, 1801, 180a, 180f, 1813）
+[12:29:41] 语音：这台遥控器**没有语音服务**（ATVV，ab5e0001）…      ← wrong conclusion
+[12:29:45] 语音：连接遥控器 …（retry every 3 s, forever）
+```
+
+Press a D-pad key afterwards and even `[按键] 上 → UP` never appears — **keys and voice die together**.
+
+### 8.2 Root cause: `Roles.start()` starts voice before keys
+
+In upstream `app.py`, `self.voice.start()` runs **before** `self.keytap.start()`. Both threads then
+race for the single BLE link:
+
+1. Voice creates a fresh link → per the table in §7 it only sees 5 basic services, no ATVV;
+2. Voice reports "this remote has no voice service" and **retries every 3 seconds**;
+3. Every failed attempt leaves a **half-open WinRT connection** in the Bluetooth stack, so the
+   Windows HID stack can never grab the link again;
+4. Keys stop working too — the user sees "the voice key does nothing" while the whole link is
+   being killed by our own retries.
+
+Step 2's message is the worst part: it turns a software bug into a hardware verdict.
+
+### 8.3 Fix 1: invert the order and wait for HID to actually hold the link
+
+```python
+# app.py  Roles.start()
+if self.keytap is None and importlib.util.find_spec("frida") is not None:
+    ...
+    self.keytap.start()
+    _wait_keytap_ready(self.keytap, 3.0)   # ← wait until the HID collection is open
+if self.voice is None:
+    ...
+    self.voice.hid_probe = lambda: bool(getattr(self.keytap, "ready", False))
+    self.voice.start()
+```
+
+`_wait_keytap_ready()` polls `KeyTap.ready` (set once the local HID handle is open) — tens of
+milliseconds in practice, 3 s is only a ceiling. It never blocks startup: if it cannot get a
+handle, voice sees "HID is not there" and falls back to connecting on its own.
+
+### 8.4 Fix 2: the link guard — never connect while the remote is asleep
+
+Reordering alone is not enough: voice disconnects and reconnects, and a reconnect can still land
+ahead of HID. So `voice.py` gained `_wait_hid_awake()`, evaluated **before every connection
+attempt**:
+
+| State | Behaviour |
+| --- | --- |
+| `hid_probe()` false (HID not holding the link) | No gate; voice connects as before |
+| HID holding + a key arrived within the last 20 s | Proceed — that is the only window where connecting works |
+| HID holding + remote asleep (outside the window) | **Wait quietly**; no connection, at most one hint per 60 s |
+
+The window is `HID_AWAKE_WINDOW_S = 20.0`. It opens on `poke()`, which the key hook
+(`KeyTap.on_activity`) calls for every HID report — **including the voice key itself**.
+
+Two supporting changes:
+
+- Seeing "only 5 basic services" now closes the window immediately (`self._activity_at = 0`),
+  handing the link back to HID instead of retrying in a loop;
+- The strong "this remote has no voice service" verdict moved from the **first** miss to **three
+  consecutive** misses, and the wording is now "most likely" plus a way out (restart, press a key).
+
+### 8.5 Fix 3: re-send GET_CAPS after the remote wakes up
+
+`GET_CAPS (0A 00 04 00 01)` is written only once, right after connecting, while the remote falls
+asleep between voice presses. When it wakes it still sends `0x04` ("pressed") but not a single
+audio frame — the log shows `本段 0~5 帧`, and it sounds like "the voice key does nothing". Easy to
+misdiagnose as a broken key.
+
+`_on_status()` now remembers the frame count of the previous press and, **if that press was starved
+(< 20 frames), re-sends GET_CAPS twice on the next press** (immediately and 0.3 s later), which puts
+the remote back into recording state.
+
+### 8.6 How to verify
+
+```bash
+python tests/test_gate.py      # 4 guard rules, no remote needed
+```
+
+On hardware: restart the client → the log must show `按键映射：本地 HID 直读` **first**, then
+`语音：等遥控器醒一次` (not `语音：连接遥控器…`) → press any remote button →
+`语音：系统 HID 已握住链路 —— 开始建语音连接` → `语音：已连接遥控器` → **10 services**
+(including `ab5e0001`) → `语音：就绪`.
+
+---
+
+## 9. Verification checklist
 
 1. Startup log should contain:
    ```
    按键映射：本地 HID 直读（1 个集合，VID_18D1&PID_9450，不经 frida、不需要提权）
    ```
+   and it must come **before** any `语音：…` line; the next voice line should be
+   `语音：等遥控器醒一次 —— 先按一下遥控器任意键…`, not `语音：连接遥控器…`.
+   Seeing "连接遥控器…" means the order regressed — see §8.
 2. UI → key mapping status: `运行中（本地 HID 直读）`.
 3. Press a D-pad key → `[按键] 上 → UP（按住·连发）`; **holding must keep moving**.
+   The first press should also produce `语音：系统 HID 已握住链路 —— 开始建语音连接` and
+   `语音：已连接遥控器`.
 4. Hold the voice key → `语音：▼ 开始`, release → `语音：▲ 结束（本段 N 帧音频 ≈ x.xs）`.
    Frames must be well above zero (≈62 frames per second of speech); a handful of frames means
-   the remote never entered recording state.
+   the remote never entered recording state — GET_CAPS is now re-sent on the next press (§8.5).
 5. **Double click**: map "double → `Esc`" on a key, press it twice quickly — only `Esc` fires,
    **never** the single action as well. A single press fires the single action after 0.3 s
    (expected, see §5.2).
@@ -399,15 +504,16 @@ back to frida (another app holds the HID collection exclusively, or the VID/PID 
 
 ---
 
-## 9. Diff against upstream
+## 10. Diff against upstream
 
 ```
  new: hidlocal.py      | 213
- app.py                | 100 +++++++++---
- keys.py               | 489 +++++++++++++++++++++++++++++++++++++++++++++++---
- tap.js                |  19 ++++--
- web/index.html        | 228 ++++++++++++++++++++++++---
- 4 files changed, 769 insertions(+), 67 deletions(-)
+ app.py                | 159 +++++++++++++----
+ keys.py               | 549 ++++++++++++++++++++++++++++++++++++++++++++++++---
+ tap.js                |  19 +-
+ voice.py              | 164 +++++++++++++++--
+ web/index.html        | 228 ++++++++++++++++++++++--
+ 6 files changed, 1237 insertions(+), 95 deletions(-)
 ```
 
 By feature:
@@ -415,8 +521,9 @@ By feature:
 | File | Change | Section |
 | --- | --- | --- |
 | `hidlocal.py` | new: SetupAPI enumeration + `ReadFile` | §2 |
-| `keys.py` | `REPORT_TABLES`, `hidlocal` backend, `repeat`, `GestureRouter`, `open_target` | §1 §2 §3 §5 |
-| `app.py` | recommended keymap, `text`+`enter`, recursive `_clean_mapping`, gesture-aware `describe_mapping` | §4 §5 |
+| `keys.py` | `REPORT_TABLES`, `hidlocal` backend, `repeat`, `GestureRouter`, `open_target`, self-check counts local HID | §1 §2 §3 §5 |
+| `app.py` | startup order (HID first, then voice), `_wait_keytap_ready`, recommended keymap, `text`+`enter`, recursive `_clean_mapping`, gesture-aware `describe_mapping` | §4 §5 §8 |
+| `voice.py` | link guard `_wait_hid_awake`, `hid_probe`, hand the link back on a 5-service result, re-send `GET_CAPS` | §8 |
 | `tap.js` | accepts `0x01`, fixed nullify offset | §1 (drive-by) |
 | `web/index.html` | gesture tabs, auto-Enter switch, `open` type, `normMapping` no longer drops fields | §5 |
 
@@ -429,7 +536,7 @@ machines/drivers still go through frida):
 
 ---
 
-## 10. License
+## 11. License
 
 Upstream is MIT (see `LICENSE`); these changes are released under the same terms.
 This fork ships source changes only, no upstream binary releases.
