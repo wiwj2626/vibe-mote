@@ -527,86 +527,87 @@ On hardware: restart the client → the log must show `按键映射：本地 HID
 (including `ab5e0001`) → `语音：链路自检 —— 电量 …` → `语音：就绪` → hold the voice key →
 `语音：▼ 开始` / `▲ 结束（本段 60+ 帧）`.
 
-### 8.9 Fix 5: wait for the **encrypted** link before connecting
+### 8.9 The real cause of "the voice key suddenly died": disconnecting without MIC_CLOSE
 
-This one is the hardest to find, and it is why the same key press sometimes works and
-sometimes yields only 5 services.
+**First, a myth busted**: earlier notes in this file blamed the mute key. That was
+**wrong** — the mute key is a red herring here.
 
-**Symptom**
-
-```
-语音：缺少 ATVV 特征（本次枚举到 5 个服务：
-      00001800, 00001801, 0000180a, 0000180f, 00001813）
-```
-
-**Diagnostic**: that table does not even contain `00001812` (HID over GATT). A remote that
-legitimately holds a HID link cannot enumerate that table — so this is *not* "we stole the HID
-link", it is a **fresh link that never completed pairing/encryption**. The remote only exposes
-`1812` (HID) and `ab5e` (ATVV) on an encrypted link; unencrypted it hands out only
-1800/1801/180a/180f/1813.
-
-**Controlled observation** (same remote, same PC, same day):
-
-| Time | Delay between key press and connect | Enumeration | Result |
-| --- | --- | --- | --- |
-| 13:16:09 | 15 s (connect timeout + scan) | **10**, incl. `ab5e0001` | 8 voice captures, all good |
-| 13:18:42 | almost immediately | 5, no ATVV | failed |
-| 13:22:34 | almost immediately | 5, no ATVV | failed |
-
-The difference is **timing**: at the instant of a key press, Windows' HID sub-device is still
-negotiating encryption. Whoever connects first decides the encryption state of the link. The old
-line "遥控器有按键活动 —— 不再退避，立刻重试连接" was not a feature here, it was the bug.
-
-**Fix**
-
-```python
-HID_POST_KEY_SETTLE_S  = 2.5   # after a key press, wait for the handshake before connecting
-HID_SETTLE_CAP_S       = 6.0   # but a user mashing the D-pad keeps refreshing the timestamp
-UNPAIRED_RETRY_DELAY_S = 8.0   # after grabbing a bad link, do not retry in place
-```
-
-The third constant matters as much as the first: grab a bad link → drop it and hand it back →
-reconnect "immediately" → grab *another* unencrypted link. That is how three identical bad tables
-appeared in a row. Backing off 8 s lets Windows re-establish properly.
-
-**Once this state is written into the Windows GATT cache it does not heal by itself** — fixed code
-cannot undo it; the device has to be removed and paired again (see §8.7). After doing exactly that,
-13:33:28 produced the full 10-service table:
+**The moment it happened** (2026-10-27 14:11, straight from the log):
 
 ```
-[13:33:28] 语音：服务表 … ab5e0001[ab5e0002:W,ab5e0003:n,ab5e0004:n] …
-[13:33:30] 语音：链路自检 —— 电量 95%，固件=26.5，型号=A3，厂商=Google Inc.
-[13:33:30] 语音：就绪
-[13:33:42] [按键] 语音 → 按住 RALT   ▼ 开始（第 1 次会话）
-[13:33:45] ▲ 结束（本段 81 帧音频 ≈ 1.3s）
-[13:34:17] [按键] 语音 → 按住 RALT   ▼ 开始（第 2 次会话）
-[13:34:19] ▲ 结束（本段 61 帧音频 ≈ 1.0s）
+[14:11:14] 语音：▼ 开始（第 1 次会话）
+[14:11:16] ▲ 结束（本段 58 帧音频 ≈ 0.9s）
+[14:11:29] 语音：▼ 开始（第 2 次会话）
+[14:11:31] ▲ 结束（本段 74 帧音频 ≈ 1.2s）      ← voice was perfectly fine
+[14:11:56] 探活失败（第 2/2 次）→ 判定僵死 → force_reconnect   ← culprit
 ```
 
-### 8.10 Two messages that lied (both fixed)
+After that, three fresh sessions (14:16 / 14:21 / 14:31) and the remote never sent
+`0x04` again — while before 14:11 it was healthy (58 frames, 74 frames). The culprit
+was a reconnect that dropped the link **without closing the mic first**.
 
-**① "this remote most likely has no voice service"** — the self-check used to say this after three
-consecutive attempts that only saw basic services, steering the user toward "the hardware is
-broken". In reality every occurrence of the §8.9 scenario produced exactly that result. It now
-branches on whether `1812` is present: `1812` present but no `ab5e` is a genuine "no voice";
-no `1812` at all means the pairing/encryption state is gone and the device must be re-paired.
+**Why**: if the remote thinks the mic is still open and the host disconnects anyway,
+its state machine sticks. From then on no reconnect and no process restart helps.
 
-**② "系统 HID 正在重建（遥控器刚换了电池 / 重新配对？）"** — this stayed on screen after every
-restart, before any key was pressed. `_hid_state()` conflated "is the link held?" with "have we
-seen a key report?": the moment the collections open, `local_hid` is `True`, but `ready` only
-flips on the first HID report. It now looks only at `local_hid` plus the `HID_SETTLE_S` (8 s)
-settle window. Returning `ok` is safe — `ok` only permits connecting within 20 s of a key press,
-so with no key press nothing happens; only the wording changes to "press any remote button".
+The reference implementation is explicit about this (remotemic-src / RC003,
+`ble_transport_winrt.py`, `send_mic_close_threadsafe`):
 
-Measured (collections opened at 13:30:31, UI still claimed "rebuilding" at 13:32:05):
+> "before it ever touches GATT resources (MIC_CLOSE, CCCD, characteristic/service/
+> device disposal)" — **close the mic, then tear the resources down**.
 
-```
-[13:30:31] 按键映射：本地 HID 直读（1 个集合…）
-[13:31:08] 语音：系统 HID 正在重建（…）        ← false alarm
-[13:32:05] 界面：等 HID 稳定（遥控器正在重连）   ← false alarm
-```
+We had it backwards: a plain `disconnect()`.
 
----
+**Fix** (`voice.py`): `_close_current()` now sends `MIC_CLOSE` and waits 0.25 s before
+tearing down the GATT resources.
+
+**Two more alignments with the reference implementation** (both were missing):
+
+| Moment | Reference | Before | Now |
+|---|---|---|---|
+| Voice key pressed | `MIC_OPEN` (`0C 00`) | nothing | `MIC_OPEN` |
+| Voice key released | `MIC_CLOSE` (`0D 00`) | nothing | `MIC_CLOSE` |
+| Idle keep-alive | **never sends commands periodically** | `GET_CAPS` every 20 s | none |
+
+About `GET_CAPS`: ATVV v1.0 uses `[0x0A][Version:2][Codecs:1][Interaction:1]` — **6
+bytes**. We used to send the malformed 5-byte `0A 00 04 00 01`, which the remote ignores,
+so the "keep-alive" path **never did anything**. This firmware does not answer CAPS at
+all (no `0x0B` reply across the 14:16 / 14:21 / 14:31 sessions), so it is now not sent
+at connect time either (set `voice.send_caps = true` in `config.json` to enable).
+
+> The probe was fixed too: it now first checks whether the firmware answers CAPS at
+> all. If it never does, the "wedged" verdict is disabled permanently, so a healthy
+> session can never be killed (the first version did exactly that at 14:11:56).
+
+### 8.10 The mute key never reaches Windows on this remote (three independent proofs)
+
+To be clear: **the mute key has nothing to do with the voice freeze** (§8.9). But it
+is a problem in its own right: on this remote, **mute / volume± / power / input never
+make it to Windows at all**.
+
+Three independent proofs:
+
+1. **HID Consumer collection** (`page0x000C`, 3-byte reports): zero packets on mute.
+2. **HID vendor collection** (`page0xFF01`, 21-byte reports): zero packets all session.
+3. **Full link capture** (BTHPORT ETW provider `{8A1F9517-3A8C-4A9E-A018-4F17A200F277}`,
+   event 402, 120 s window): the remote's connection carried only four battery
+   notifications (`1b 21 00 5f`) and **no button report whatsoever**.
+
+**Why can another project remap mute?** Because its remote is a **clone**.
+
+The device profile in remotemic-src (无线麦) documents the same Chromecast Remote as
+sending ordinary buttons as **8-byte notifications on ATT attribute `0x0029`** (first
+byte = button code, mute = `08`) — and its README states the pictured Google remote was
+bought on a discount platform: "图示谷歌款购自某多多平台「IN数码配件」". A 15-yuan
+**clone sends every button over BLE**, which is why it can be remapped.
+
+Ours is the **genuine Google A3** (the link self-check reads: vendor `Google Inc.`,
+model `A3`, firmware `26.5`). Genuine units keep volume/power/mute/input on **IR**, so
+Windows never sees them. Clones and genuine units share the same VID/PID
+(`18D1:9450`), so the device identity alone cannot tell them apart.
+
+**Conclusion**: on this genuine remote, mute/volume/power/input **cannot be mapped**.
+That is hardware behaviour, not a software defect. To get a remappable mute key you
+need a clone remote.
 
 ## 9. Verification checklist
 

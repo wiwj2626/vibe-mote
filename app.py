@@ -1578,28 +1578,87 @@ def run_reset_bt(on_line):
 
 
 def run_bt_capture(on_line, seconds=60):
-    """已经以管理员身份在跑：执行提权脚本的 --bt-capture，把输出喂给界面。
+    """抓一次蓝牙 ATT 报文（BTHPORT ETW / 事件 402），在**本进程内**做。
 
-    抓的是 BTHPORT 的 ETW 事件 402（ACL 里的 ATT 报文）。用途见
-    elevate_setup.bt_capture 的说明：谷歌遥控器的普通按键是属性句柄 0x0029 上的
-    8 字节 ATT 通知（静音 = 首字节 0x08），而 Windows 的 HID 类驱动只翻译了其中
-    一部分，静音/音量/电源/输入源在驱动层就被丢掉了 —— 所以必须下到 ATT 层才看得见。
+    为什么要在进程内而不是再拉一个子进程：这个客户端自己就是管理员权限，
+    子进程反而多两重坑 —— ① pythonw.exe 没有标准输出句柄，脚本 print 的内容
+    全丢（实测子进程只跑到第一行日志就"人间蒸发"）；② 管道编码把 traceback
+    截断，看不到真正的错误行。
+
+    抓的是什么：谷歌遥控器的普通按键是 ATT 属性 0x0029 上的 **8 字节通知**
+    （首字节是按键码：静音 08 / 音量加 0C / 音量减 0D / 电源 01 / 输入源 11）。
+    Windows 的 HID 类驱动只翻译了报告描述符里声明的那几个键，其余在驱动层就
+    被丢掉了 —— 所以用 HidD_ReadFile 永远读不到静音/音量/电源/输入源，
+    必须下到 ATT 层才看得见。
     """
     import subprocess
-    on_line(i18n.L(f"开始采集蓝牙报文（{seconds} 秒）—— 【请在窗口内按一下静音键】",
-                   f"Capturing Bluetooth traffic for {seconds} s — press the mute key now"))
+    import winreg
+
+    def say(msg):
+        on_line(msg)
+        BUS.log("[蓝牙报文采集] " + msg)
+
+    outdir = os.path.join(HERE, "bt_capture")
     try:
-        p = subprocess.run([sys.executable, ELEVATE_PY, "--bt-capture", str(int(seconds))],
-                           capture_output=True, text=True, encoding="utf-8",
-                           errors="replace", cwd=HERE, timeout=int(seconds) + 240)
-        for ln in (p.stdout or "").splitlines():
-            on_line(ln)
-        if p.stderr:
-            on_line((p.stderr or "").strip()[:300])
-        on_line(i18n.L("采集结束 —— 导出的文件在 bt_capture 目录里",
-                       "Capture finished — exported files are in the bt_capture folder"))
+        os.makedirs(outdir, exist_ok=True)
     except Exception as e:
-        on_line(i18n.L(f"失败：{e!r}", f"Failed: {e!r}"))
+        say(i18n.L(f"建目录失败：{e!r}", f"mkdir failed: {e!r}"))
+        return
+    etl = os.path.join(outdir, "bt.etl")
+    csv = os.path.join(outdir, "bt.csv")
+    xml = os.path.join(outdir, "bt.xml")
+
+    say(i18n.L("=== 蓝牙报文采集（BTHPORT ETW / 事件 402）===",
+               "=== Bluetooth capture (BTHPORT ETW / event 402) ==="))
+    if not is_elevated():
+        say(i18n.L("需要管理员权限", "Administrator rights required"))
+        return
+    say(i18n.L("管理员权限 ✓", "Administrator rights OK"))
+
+    # 1) 打开 BTHPORT 详细事件
+    try:
+        with winreg.CreateKeyEx(winreg.HKEY_LOCAL_MACHINE,
+                                 r"SYSTEM\CurrentControlSet\Services\BthPort\Parameters",
+                                 0, winreg.KEY_SET_VALUE) as k:
+            winreg.SetValueEx(k, "EtwLogSensitiveData", 0, winreg.REG_DWORD, 1)
+            winreg.SetValueEx(k, "MaxEtwBytes", 0, winreg.REG_DWORD, 0x400)
+            winreg.SetValueEx(k, "EtwDropLargeEvents", 0, winreg.REG_DWORD, 0)
+        say(i18n.L("✓ BTHPORT 详细事件已开启", "BTHPORT verbose events enabled"))
+    except Exception as e:
+        say(i18n.L(f"✗ 开详细事件失败：{e!r}", f"failed to enable verbose events: {e!r}"))
+
+    def run(args, timeout=60):
+        try:
+            pr = subprocess.run(args, capture_output=True, text=True,
+                                encoding="utf-8", errors="replace", timeout=timeout)
+            return ((pr.stdout or "") + (pr.stderr or "")).strip()
+        except Exception as e:
+            return "ERR %r" % (e,)
+
+    # 2) 建 ETW 会话（只收这一个提供程序）
+    run(["logman", "stop", "BtHci", "-ets"])
+    out = run(["logman", "create", "trace", "BtHci",
+               "-p", "{8A1F9517-3A8C-4A9E-A018-4F17A200F277}",
+               "0xFFFFFFFFFFFFFFFF", "0xFF", "-o", etl, "-ets"])
+    say("logman create: " + out[:300])
+    say(i18n.L(f"▶ 采集开始，{seconds} 秒窗口 —— 【现在请按一下静音键】，再按下上、音量加",
+               f"▶ capturing for {seconds} s — press the MUTE key now, then up and volume+"))
+    try:
+        time.sleep(int(seconds))
+    except Exception:
+        pass
+
+    # 3) 停止 + 导出
+    run(["logman", "stop", "BtHci", "-ets"])
+    say(i18n.L("采集结束，正在导出…", "capture finished, exporting…"))
+    run(["tracerpt", etl, "-o", csv, "-of", "CSV", "-y"], timeout=240)
+    run(["tracerpt", etl, "-o", xml, "-of", "XML", "-y"], timeout=240)
+    for f in (etl, csv, xml):
+        try:
+            say("  %s  %d 字节" % (f, os.path.getsize(f)))
+        except Exception:
+            say("  %s  不存在" % f)
+    say(i18n.L("采集完成", "capture done"))
 
 
 def follow_elevate_log():
