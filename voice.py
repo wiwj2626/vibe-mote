@@ -981,6 +981,31 @@ class VoiceRole(threading.Thread):
             self._wake_rearm_at = time.time()
             self._try_open_mic()
 
+        # ★★ 按键后备重连（对齐参考实现的「普通按键后备」）。
+        #   判据：**用户在按方向键**（说明人在用遥控器）＋**这次连接以来一次语音都
+        #   没成功过** ＋ 已经过了 90 秒 —— 这三个条件同时成立，就说明遥控器的录音
+        #   通道挂死了（最典型的成因：误按了静音键）。
+        #
+        #   为什么必须"重开整个语音会话"而不是只发 MIC_OPEN：实测（15:42~15:43）
+        #   MIC_OPEN 连发 4 次（15:42:13 / 15:42:33 / 15:43:21 / 15:43:50），
+        #   一次语音会话都没起来 —— 只在同一条链路上开麦是救不回来的。
+        #   参考实现的 README 也写着「谷歌遥控器启动时遇到临时语音连接失败，可自动
+        #   补连；含首次及普通按键后备，最多尝试五次」。
+        #
+        #   重开会走 _close_current()：那里现在**先发 MIC_CLOSE 再断链** —— 正是
+        #   "把遥控器认为还开着的麦关掉"这一步，理论上也是解开挂起的关键。
+        now = time.time()
+        if (self.connected
+                and not getattr(self, "_active", False)
+                and self.sessions == getattr(self, "_sessions_at_connect", 0)
+                and now - getattr(self, "_awake_at", 0.0) > 90.0
+                and now - getattr(self, "_reopen_at", 0.0) > 60.0):
+            self._reopen_at = now
+            self._log("语音：这次连接以来一次语音都没成功，而遥控器明显在被使用 —— "
+                      "重开语音会话（MIC_CLOSE → 断链 → 重连）。"
+                      "这能解掉「误按静音键把录音通道挂起」的状态。")
+            self.force_reconnect()
+
     def _try_open_mic(self, hold=1.5, quiet=False):
         """主动开一次麦；开完没人说话就把麦收回去（不留麦开着）。
 
@@ -1798,6 +1823,9 @@ class VoiceRole(threading.Thread):
         self._caps_seen = 0
         self._sync_seen = 0
         self._caps_info = None
+        # 本次连接以来成功过几次语音会话（"按键后备"判定用）
+        self._sessions_at_connect = self.sessions
+        self._reopen_at = 0.0
 
         def on_status(_c, data: bytearray):
             b = bytes(data)
