@@ -1649,7 +1649,8 @@ class VoiceRole(threading.Thread):
         self._last_unpaired = False
         self._gate_note = ""               # 已连上 → 下次再进守卫要能重新提示
         self.connected = True
-        self.note = i18n.L("已连接", "Connected")
+        self.note = i18n.L("已就绪（按了没反应？取电池 10 秒）",
+                           "Ready (no response? pull the battery for 10 s)")
         self._emit("status", {"connected": True, "note": self.note})
         if self.sink:
             self.sink.reset()
@@ -1832,6 +1833,33 @@ class VoiceRole(threading.Thread):
         self._log(f"语音：已连接 {wait:.0f} 秒，还没收到语音数据"
                   f"（控制响应 {self._ctrl_seen} 条）—— 按一下语音键试试；"
                   f"按了也没反应的话，先看上面「链路自检」那行能不能读出电量")
+
+        # ★ 第二级（3 分钟）：这时候基本可以确定是遥控器僵死了，给一条**真正能解决
+        #   问题**的建议，而不是继续让他对着"一切正常"的日志发呆。
+        #   真机实证（2026-10-27 13:36~13:46）：按过静音键之后，链路 10 个服务全在、
+        #   电量读得出、GET_CAPS 写入无报错，但遥控器连 0x04 都不发；完整重连、
+        #   MIC_CLOSE(0d)、MIC_OPEN(0c)、GET_CAPS(0a) 全部无效 —— 只能取电池。
+        await asyncio.sleep(160.0)
+        if self.stop_flag.is_set() or not self.connected:
+            return
+        if self.sessions != sessions0:
+            return
+        self._log(i18n.L(
+            "语音：链路正常，但 3 分钟里一条 ATVV 报文都没有 —— 遥控器的录音通道"
+            "多半僵死了。**按过静音键最容易触发**：静音键走红外，Windows 收不到它，"
+            "但它会把录音通道挂起。软件侧救不回来（重连 / MIC_CLOSE / MIC_OPEN / "
+            "GET_CAPS 都试过无效），**取出电池等 10 秒装回**即可 —— 配对还在，"
+            "不用删设备重新配对。",
+            "Voice: the link is healthy, yet there has been no ATVV traffic for 3 "
+            "minutes — the remote's recording channel is most likely wedged. "
+            "**Pressing the mute key is the usual trigger**: it goes over IR so Windows "
+            "never sees it, but it suspends the recording channel. Nothing on the "
+            "software side recovers it (reconnect / MIC_CLOSE / MIC_OPEN / GET_CAPS were "
+            "all tried and failed). **Pull the battery for 10 s and put it back** — the "
+            "pairing survives, no need to unpair."))
+        self.note = i18n.L("按语音键没反应？取电池 10 秒即可",
+                           "Voice key not responding? Pull the battery for 10 s")
+        self._emit("status", {"connected": True, "note": self.note})
 
     # ---------- 语音键事件 ----------
     async def _probe_link(self, client):

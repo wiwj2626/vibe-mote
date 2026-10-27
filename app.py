@@ -3226,6 +3226,18 @@ def main():
         ours = set(our_instances(procs))
         foreign = owners - ours
         if foreign:
+            # ★ 先等一会儿再判"外来程序"（真机踩坑，2026-10-27 13:41:52）：
+            #   界面上点「重启」时，旧实例正在退出但端口还没释放，新实例一上来就
+            #   判定"被另一个程序占着"然后自己退出；旧实例随后也退出了 —— 结果
+            #   两边都没了，客户端直接空窗。那种情况里"外来者"其实就是我们自己。
+            #   等最多 10 秒再看：自己的旧实例几秒内必然消失，真正的外来程序不会。
+            for _ in range(30):
+                time.sleep(0.33)
+                owners = set(port_owners(port))
+                foreign = owners - ours
+                if not foreign:
+                    break
+        if foreign:
             detail = "、".join(f"PID {p}" for p in sorted(foreign))
             BUS.log(i18n.L(
                 f"界面端口 {port} 被**另一个程序**占着（{detail}），它不是本目录的客户端 —— "
