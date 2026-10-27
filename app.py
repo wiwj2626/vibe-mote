@@ -3004,6 +3004,18 @@ class Handler(BaseHTTPRequestHandler):
                 "已丢掉当前会话，正在重连（约 20 秒）" if ok else "重连没发起 —— 当前没有会话",
                 "Dropped the session, reconnecting (~20 s)" if ok
                 else "Nothing to reconnect — no active session")})
+        if act == "voice-repair":
+            # 「一键修复语音僵死」：关麦 → 开麦 → 看遥控器回不回话。
+            # 不重启客户端、不动 HID 链路、不重新配对。
+            v = ROLES.voice if ROLES else None
+            if v is None:
+                return self._json({"ok": False, "msg": i18n.L(
+                    "语音角色没在跑", "Voice role is not running")})
+            ok = v.repair(on_line=lambda ln: BUS.log(ln))
+            return self._json({"ok": bool(ok), "msg": i18n.L(
+                "开始修复语音（几秒后看日志）" if ok else "语音还没连上",
+                "Repairing the voice channel (watch the log)" if ok
+                else "Voice is not connected")})
         if act == "voice-rearm":
             # 「重新激活语音」：补发一次 GET_CAPS。
             # 为什么需要这个按钮/接口：真机上踩过两次 —— 会话一直连着（connected: True），

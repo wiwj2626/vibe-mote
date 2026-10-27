@@ -967,15 +967,102 @@ class VoiceRole(threading.Thread):
         #   真机上「放一会儿再按语音键没反应」就是录音态过期 —— 而那种时候遥控器
         #   连 0x04 都不发，只能由我们主动补（否则要等保活秒表走到）。
         #   限流 10 秒一次：HID 报文可能一秒钟来几十条，不能每条都写特征。
+        #
+        # ★ 这里**不再补发 GET_CAPS**，改成主动"开麦"（MIC_OPEN）。理由有二：
+        #   ① GET_CAPS 是"能力协商"，只在建链时发一次就够；这台固件根本不回它，
+        #      反复发属于对空气喊话。**更要命的是：真机上两次"语音全死"都紧跟在
+        #      一次 GET_CAPS 之后**（13:36:06 与 14:11:56），而且都是在遥控器**空闲**
+        #      的时候 —— 很像遥控器把这条报文当成非法命令、进了错误状态。
+        #      既然不必要，就彻底不发。
+        #   ② MIC_OPEN 是遥控器**本来就认**的命令（参考实现按下语音键时就发它），
+        #      用来"把麦重新打开"是安全的。而 HID 有活动 = 遥控器确认醒着，
+        #      正是试它的时候。
         if self.connected and time.time() - getattr(self, "_wake_rearm_at", 0.0) >= 10.0:
-            loop = getattr(self, "_loop", None)
-            if loop is not None:
-                self._wake_rearm_at = time.time()
+            self._wake_rearm_at = time.time()
+            self._try_open_mic()
+
+    def _try_open_mic(self, hold=1.5):
+        """主动开一次麦；开完没人说话就把麦收回去（不留麦开着）。
+
+        为什么需要它：遥控器一旦把麦克风关掉，就**不会再发 0x04**，于是我们永远
+        等不到"按下"，也就永远不会发 MIC_OPEN —— 语音就这样彻底哑了。
+        而"HID 方向键有活动"是唯一还能拿到的、说明遥控器醒着的信号，
+        所以用它当触发器：每有一次方向键活动，就主动开一次麦试试。
+
+        开完 hold 秒还没开始录音（`_active` 仍为 False）→ 发 MIC_CLOSE 收回去，
+        免得麦一直开着（隐私）。
+        """
+        if not self.connected or getattr(self, "_ctl", None) is None:
+            return
+        if not self.atvv_cmd(MIC_OPEN_CMD):
+            return
+        self._log("语音：遥控器有按键活动 —— 主动开一次麦（MIC_OPEN），"
+                  "看看能不能把录音通道叫醒")
+
+        def _close_if_idle():
+            if self.stop_flag.is_set():
+                return
+            if not getattr(self, "_active", False):
+                self.atvv_cmd(MIC_CLOSE_CMD)
+
+        try:
+            t = threading.Timer(hold, _close_if_idle)
+            t.daemon = True
+            t.start()
+        except Exception:
+            pass
+
+    def repair(self, on_line=None):
+        """一键修复语音僵死：关麦 → 开麦 → 看遥控器有没有回话。
+
+        用于「界面显示已连接，但按语音键一点反应都没有」的状态。
+        **不重启客户端、不动 HID 链路、不重新配对** —— 只在 ATVV 这一层来回两下。
+
+        为什么要"来回两下"：遥控器一旦把麦克风关掉就不再发 `0x04`，我们也就永远
+        等不到"按下"。显式 MIC_CLOSE（把状态清干净）再 MIC_OPEN（重新打开），
+        是唯一能把它的状态机推回正轨的组合 —— 参考实现按下/松开时发的就是这两条。
+
+        返回 True = 遥控器回来了（会话数增加了）；False = 没回来。
+        """
+        def say(msg):
+            if on_line is not None:
                 try:
-                    loop.call_soon_threadsafe(
-                        lambda: self._rearm_caps(min_gap=10.0, reason="wake"))
+                    on_line(msg)
                 except Exception:
                     pass
+            self._log(msg)
+
+        if not self.connected:
+            say(i18n.L("语音：还没连上 —— 先按一下遥控器任意键让它连上",
+                       "Voice: not connected — press any remote button first"))
+            return False
+
+        sessions0 = self.sessions
+        say(i18n.L("语音：开始修复 —— 关麦 → 开麦，等遥控器回话…",
+                   "Voice: repairing — closing the mic, then opening it, waiting for the remote…"))
+        self.atvv_cmd(MIC_CLOSE_CMD)
+
+        def _step2():
+            if self.stop_flag.is_set() or not self.connected:
+                return
+            time.sleep(0.5)
+            self.atvv_cmd(MIC_OPEN_CMD)
+            time.sleep(3.0)
+            if self.sessions > sessions0:
+                say(i18n.L("语音：修好了 —— 遥控器已经开始回话，按住语音键试试",
+                           "Voice: fixed — the remote is answering again, try the voice key"))
+            else:
+                say(i18n.L(
+                    "语音：还是没回话 —— 说明遥控器自己的状态机已经僵住了，"
+                    "软件侧救不回来。取电池 10 秒装回（配对不会丢），"
+                    "再不行才需要删设备重新配对。",
+                    "Voice: still silent — the remote's state machine is wedged and "
+                    "nothing on the software side can undo it. Pull the battery for 10 s "
+                    "and put it back (the pairing survives); re-pairing is the last resort."))
+
+        t = threading.Thread(target=_step2, daemon=True)
+        t.start()
+        return True
 
     def rearm(self):
         """手动补发 GET_CAPS —— 给界面/接口留的"一键救急"。
