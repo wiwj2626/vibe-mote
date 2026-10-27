@@ -1091,20 +1091,21 @@ class VoiceRole(threading.Thread):
                            "Voice: fixed — the remote is answering again, try the voice key"))
             else:
                 say(i18n.L(
-                    "语音：还是没回话 —— 遥控器的录音通道僵死了，软件侧救不回来。"
-                    "应急：取出电池等 10 秒装回（配对不丢）。"
-                    "如果**反复**发生，说明这支遥控器的「静音/音量/电源/输入源」"
-                    "被配置成了**红外发射**（给电视用的，电脑收不到，"
-                    "但一按就把语音挂死）—— 根治办法是给遥控器恢复出厂设置，"
-                    "清掉红外配置，这些键就会回到蓝牙上，既能映射也不再挂死语音。",
+                    "语音：还是没回话 —— 遥控器的录音通道僵死了，软件侧救不回来。\n"
+                    "恢复办法（实测有效，顺序别变）：\n"
+                    "  1) 取出电池；\n"
+                    "  2) 点界面上的「一键重配遥控器」删掉这台设备；\n"
+                    "  3) 装回电池，重新配对。\n"
+                    "⚠ 只取电池装回**不够** —— 实测那样会变成「已配对但连不上、"
+                    "连上又马上断」，必须连设备一起删掉。",
                     "Voice: still silent — the recording channel is wedged and nothing on "
-                    "the software side recovers it. Quick fix: pull the battery for 10 s "
-                    "(the pairing survives). If this keeps happening, this remote's "
-                    "mute/volume/power/input keys are configured for **infrared** (they are "
-                    "meant for a TV, so the PC never sees them, yet pressing one wedges the "
-                    "voice channel). The real fix is a factory reset of the remote, which "
-                    "clears the IR setup — those keys then come back over Bluetooth, become "
-                    "mappable, and stop killing voice."))
+                    "the software side recovers it.\n"
+                    "Recovery (measured to work; keep the order):\n"
+                    "  1) pull the battery;\n"
+                    "  2) use “Re-pair remote” in the UI to delete the device;\n"
+                    "  3) put the battery back and pair again.\n"
+                    "⚠ Pulling the battery alone is NOT enough — that leaves it "
+                    "“paired but never connecting / dropping right after connecting”."))
 
         t = threading.Thread(target=_step2, daemon=True)
         t.start()
@@ -2114,11 +2115,11 @@ class VoiceRole(threading.Thread):
             "语音：链路正常，但 3 分钟里一条 ATVV 报文都没有 —— 遥控器的录音通道"
             "僵死了。**如果是按过静音键造成的，软件侧救不回来**（2026-10-27 实测："
             "MIC_OPEN / MIC_CLOSE / 全新 GATT 会话，规范拆链后重建，四种手段全部无效）。"
-            "恢复办法：**取出电池等 10 秒装回**（遥控器整机重启，状态机清零；配对不丢）。"
-            "若取电池后仍不行，再考虑删设备重新配对。"
-            "⚠ 别再按静音 / 音量 / 电源 / 输入源了 —— 这几个键在这支遥控器上被配置成"
-            "**红外发射**（给电视用的）：电脑一个字节都收不到，却会把语音通道挂死。"
-            "根治：给遥控器**恢复出厂设置**清掉红外配置，它们就会回到蓝牙上。",
+            "恢复办法（实测有效，顺序别变）：**取出电池 → 点「一键重配遥控器」删设备 → "
+            "装回电池重新配对**。⚠ 只取电池装回不够（会变成已配对却连不上）。"
+            "⚠ 别再按静音 / 音量 / 电源 / 输入源了 —— 这四个键在这支遥控器上"
+            "**一按就把语音挂死**（2026-10-27 18:15 实测：语音连续 10 次会话正常，"
+            "按一下静音立刻全废）。恢复出厂设置也改不了这个行为。",
             "Voice: the link is healthy, yet there has been no ATVV traffic for 3 "
             "minutes — the remote's recording channel is wedged. **If the mute key "
             "caused it, nothing on the software side recovers it** (measured "
