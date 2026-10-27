@@ -1069,6 +1069,13 @@ class KeyTap(threading.Thread):
                     cols = hidlocal.open_collections(vid, pid)
                     if cols:
                         self._lost_logged = False
+                        # ★ 2026-10-27 修：集合重新打开后**必须把 note 改回正常态**。
+                        #   原来只写了一行日志就 break，note 一直停在
+                        #   「HID 设备暂时不在了（等遥控器重连）」—— 于是设备明明已经
+                        #   回来了、按键也照常能按，界面上却还在报"设备不在"，
+                        #   看着像又坏了（2026-10-27 19:39 实测：语音和按键全好，
+                        #   界面却说 HID 不在）。
+                        self.note = i18n.L("运行中（本地 HID 直读）", "Running (local HID)")
                         self._log("按键映射：HID 已重新打开，继续直读")
                         break
                 if self.stop_flag.is_set():

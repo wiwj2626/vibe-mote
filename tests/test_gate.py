@@ -121,6 +121,61 @@ async def t_blocked_while_reconnecting():
     raise AssertionError("重建期间放行了 —— 会把 Windows 的 HID 重建搅乱")
 
 
+def t_keytap_note_recovers():
+    """★ 2026-10-27：HID 集合断开又回来之后，界面提示必须自己恢复。
+
+    回归的真实场景（19:39 实测）：遥控器重新配对后设备确实回来了、按键也照常能按，
+    但界面一直挂着「HID 设备暂时不在了（等遥控器重连）」—— 因为重开成功的那条分支
+    只写了一行日志，没把 note 改回正常态。ready=True 和 note 说设备不在，自相矛盾。
+
+    这里用假的 hidlocal 走一遍「打开失败 → 重试成功」，检查 note 是否被改回来。
+    """
+    import keys as keys_mod
+    import hidlocal as hidlocal_mod
+
+    real_open = hidlocal_mod.open_collections
+    real_read = hidlocal_mod.read_loop
+    real_close = hidlocal_mod.close_collections
+    calls = {"n": 0}
+
+    def fake_open(*a, **k):
+        calls["n"] += 1
+        # 第一次成功（进入直读循环），然后立刻"断开"；
+        # 之后重开时前两次失败，第三次成功 —— 覆盖"设备暂时不在"这条分支。
+        if calls["n"] == 1:
+            return [(0x000C, 1234, 3)]
+        if calls["n"] in (2, 3):
+            return []
+        return [(0x000C, 1234, 3)]
+
+    def fake_read(handle, on_report, stop_event, buffer_len=64):
+        # 立刻返回 = 模拟句柄失效
+        return False
+
+    def fake_close(cols):
+        return None
+
+    hidlocal_mod.open_collections = fake_open
+    hidlocal_mod.read_loop = fake_read
+    hidlocal_mod.close_collections = fake_close
+    try:
+        kt = keys_mod.KeyTap(lambda kind, payload=None: None)
+        kt.stop_flag.clear()
+        # 只跑重开逻辑，不让它一直转：给它 4 秒
+        t = threading.Thread(target=kt._run_local_hid, daemon=True)
+        t.start()
+        time.sleep(4.0)
+        kt.stop_flag.set()
+        t.join(timeout=3.0)
+        assert "不在" not in kt.note, f"note 没恢复，仍是：{kt.note}"
+        assert "运行中" in kt.note, f"note 不是正常态：{kt.note}"
+        print(f"  [OK] 设备回来后 note 自己恢复了：{kt.note}")
+    finally:
+        hidlocal_mod.open_collections = real_open
+        hidlocal_mod.read_loop = real_read
+        hidlocal_mod.close_collections = real_close
+
+
 async def main():
     tests = [
         ("HID 在 + 没按键 → 死等", t_blocked_when_asleep),
@@ -133,6 +188,8 @@ async def main():
     for name, fn in tests:
         print(f"[{name}]")
         await fn()
+    print("[HID 断开又回来 → 提示自己恢复]")
+    t_keytap_note_recovers()
     print("\n全部通过。日志如下：")
     for line in LOGS[:6]:
         print("   ", line)
