@@ -1535,9 +1535,30 @@ class VoiceRole(threading.Thread):
             #   这时候最该做的是立刻松手、把链路让回 HID，等下一次按键再试 —— 而不是
             #   连着重试。原来这里连续重试，正是"语音键没反应 → 方向键也不动了"的成因。
             self._activity_at = 0.0
+            # ★★ 关键判据：一条真正的 HID 链路里一定有 00001812（HID over GATT）。
+            #   连 1812 都没有 → 这条链**连 HID 都不是**，它不是"我们抢了 HID 的链"，
+            #   而是一条**没通过配对/加密协商**的新链。遥控器只对已加密的链暴露
+            #   1812(HID) 与 ab5e(ATVV)；未加密时只给 1800/1801/180a/180f/1813。
+            #   真机实证（13:18 / 13:22 三次都是同一张 5 服务表）：蓝牙电台关开一次
+            #   之后 Windows 侧的配对密钥失效，此时光等、光重试都不会好 —— 必须在
+            #   系统里删设备重新配对。原先把这种情况误报成"这遥控器没有语音服务"。
+            paired = "00001812" in uuids
             if self.misses < 3:
                 self._log("语音：这条链路不是系统 HID 那条（自己新建的链看不到 ATVV）"
                           "—— 已断开让回 HID，请按一下遥控器任意键，我再试一次")
+            elif not paired:                      # 配对/加密状态丢了
+                if not getattr(self, "_unpaired_hinted", False):
+                    self._unpaired_hinted = True
+                    self._log(i18n.L(
+                        "语音：这条链上连 HID（00001812）都没有 —— 配对/加密状态丢了，"
+                        "遥控器只肯把基础服务交给我（未加密的链它不给 HID，也不给 ATVV）。"
+                        "光等不会自己好：请到「设置 → 蓝牙和其他设备」把谷歌遥控器"
+                        "**删除设备**，取出电池等 10 秒，再重新配对一次。",
+                        "Voice: this link does not even expose HID (00001812) — the "
+                        "pairing/encryption state is gone, so the remote only hands out "
+                        "the basic services (an unencrypted link gets neither HID nor "
+                        "ATVV). Waiting will not fix it: remove the remote in Settings → "
+                        "Bluetooth & devices, pull the battery for 10 s, and pair again."))
             else:
                 if not getattr(self, "_variant_hinted", False):
                     # ★ 连续多次、每次都只有通用服务（1800/1801/180a/180f）、没有 ab5e…
@@ -1558,6 +1579,8 @@ class VoiceRole(threading.Thread):
             return
 
         self.misses = 0
+        self._unpaired_hinted = False      # 这次真连上了 → 下次再丢配对要能再提醒
+        self._variant_hinted = False
         self.connected = True
         self.note = i18n.L("已连接", "Connected")
         self._emit("status", {"connected": True, "note": self.note})
