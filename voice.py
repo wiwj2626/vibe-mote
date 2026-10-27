@@ -59,16 +59,43 @@ HID_SETTLE_CAP_S = 6.0
 UNPAIRED_RETRY_DELAY_S = 8.0
 
 
-# GET_CAPS：让遥控器进录音态并回报能力表。0x0A 命令 / 版本 0x00 / 长度 4 / 负载。
-CAPS_CMD = bytes([0x0A, 0x00, 0x04, 0x00, 0x01])
+# ─── ATVV 命令 ──────────────────────────────────────────────────────────
+# ★ 这三条字节是 2026-10-27 从一个成熟实现（remotemic-src / RC003，
+#   ovb_rc003/chromecast_voice.py 与 atvv_protocol.py）对着核出来的。
+#
+#   之前这里发的是 `0A 00 04 00 01`（5 字节），**是畸形报文**：ATVV v1.0 的
+#   GET_CAPS 是 [0x0A][Version:2][Codecs:1][Interaction:1]，必须 6 字节。
+#   遥控器收到畸形报文直接忽略 —— 也就是说：
+#       「空闲 20 秒补发 GET_CAPS 保活」这一整条路径**从来没起过作用**。
+#   日志里那行 `GET_CAPS 已写入` 只能证明"写操作没报错"，证明不了遥控器认。
+#
+#   v1.0 的形态（version >= 0x0100，本机实测遥控器就是 v1.0）：
+#     GET_CAPS  = 0A 01 00 00 02 03      (Version=0x0100, Codecs=0x02 ADPCM,
+#                                          Interaction=0x03 PTT|HTT)
+#     MIC_OPEN  = 0C 00                  (2 字节)
+#     MIC_CLOSE = 0D <session_id>        (2 字节，带回当前会话号)
+#   v0.x 的形态（只有老固件才用，保留兜底）：
+#     MIC_OPEN  = 0C 00 00 / MIC_CLOSE = 0D 00 00
+CAPS_CMD = bytes([0x0A, 0x01, 0x00, 0x00, 0x02, 0x03])
+MIC_OPEN_CMD = bytes([0x0C, 0x00])
+MIC_CLOSE_CMD = bytes([0x0D, 0x00])
+MIC_OPEN_CMD_V0 = bytes([0x0C, 0x00, 0x00])
+MIC_CLOSE_CMD_V0 = bytes([0x0D, 0x00, 0x00])
 
-# ATVV 的另外两条命令（上游从没发过）。
-# 为什么值得试：真机上遥控器闲置一会儿后会「连着但一声不响」—— 既不发 0x04
-# 也不送音频，而 GET_CAPS 补发也救不回来。最像的解释是它把"麦克风已打开"这个
-# 状态卡住了：既然它认为已经开着，就再也不会重新开。显式关一次（MIC_CLOSE）
-# 再打开，可能就把它从这个状态里拽出来。
-MIC_OPEN_CMD = bytes([0x0C, 0x00, 0x00])
-MIC_CLOSE_CMD = bytes([0x0D, 0x00, 0x00])
+# 控制通道（ab5e0004）的操作码。0x0B 是**遥控器回给我们的能力应答** ——
+# 这是整条链路上唯一一个"你问它，它一定得答"的东西，所以它能当探活心跳用。
+OP_AUDIO_STOP = 0x00
+OP_AUDIO_START = 0x04
+OP_MIC_BUTTON = 0x08
+OP_AUDIO_SYNC = 0x0A
+OP_CAPS = 0x0B
+
+# 等 CAPS 应答的时限。超过就算这次协商失败（参考实现的 CAPABILITIES_TIMEOUT）。
+CAPS_TIMEOUT_S = 3.0
+
+# 连续几轮"问了不回"就判定 ATVV 僵死。取 2 轮，配合 20 秒的间隔 =
+# 最多 40 秒就能发现，比原来的"永远发现不了"强。
+CAPS_MISS_LIMIT = 2
 
 
 def describe_services(client):
@@ -1659,6 +1686,11 @@ class VoiceRole(threading.Thread):
         last_frame = [0.0]
         self._awake_at = time.time()        # 本次会话建立时刻（静默看门狗用）
         self._ctrl_seen = 0
+        # 探活心跳的计数每段会话都要清零：它统计的是"这次 GET_CAPS 之后有没有
+        # 收到 CAPS 应答"，跨会话累加会把新会话误判成"僵死"。
+        self._caps_seen = 0
+        self._sync_seen = 0
+        self._caps_info = None
 
         def on_status(_c, data: bytearray):
             b = bytes(data)
@@ -1733,9 +1765,13 @@ class VoiceRole(threading.Thread):
             try:
                 await client.write_gatt_char(ctl, CAPS_CMD, response=use_resp)
                 self._caps_at = time.time()
-                self._log("语音：GET_CAPS 已写入（"
-                          + ("带响应写" if use_resp else "无响应写，与特征属性一致")
-                          + ("；控制通道可收响应" if ctl_notify else "") + "）")
+                # ★ 只报"已写入"会骗人：写操作成功只代表 ATT 层没报错。真正算数的
+                #   是 3 秒内有没有 CAPS 应答（见 _caps_keepalive 里的探活）。
+                self._log("语音：已发 GET_CAPS（v1.0 六字节，" + CAPS_CMD.hex(" ")
+                          + "）—— 等遥控器回能力应答（0x0B）")
+                if not ctl_notify:
+                    self._log("语音：⚠ 控制通道不能收通知 —— 收不到能力应答，"
+                              "探活心跳会一直判失败；这条链多半不是系统 HID 那条")
             except Exception as e:
                 self._log(f"语音：GET_CAPS 写入失败 {type(e).__name__}: {e}")
         # 补发 GET_CAPS 要用到这两样（见 _rearm_caps）
@@ -1777,16 +1813,23 @@ class VoiceRole(threading.Thread):
             await self._close_current()
 
     async def _caps_keepalive(self, last_frame, every=20.0, idle=20.0):
-        """空闲保活：会话还在、但已经 idle 秒没有音频 → 补发一次 GET_CAPS。
+        """空闲保活 + **探活心跳**：问 GET_CAPS，看它答不答。
 
-        真机现象（同一天复现两次）：连上之后连着用了几次都正常，搁几分钟不动，
-        再按语音键就一声不响 —— 但**会话没断**（`connected` 一直是 True），
-        遥控器连 `0x04` 都不发。说明它那个"麦克风录音态"会自己过期，
-        而 `GET_CAPS` 是唯一能把它叫回来的命令（上游只在建链时发过一次）。
+        为什么这么写（2026-10-27 修正）：以前这里的 GET_CAPS 发的是畸形报文
+        `0A 00 04 00 01`（5 字节，v1.0 要求 6 字节），遥控器直接忽略 —— 也就是
+        说这条"保活"路径**从来没起过作用**。而 `写成功` 只代表 ATT 层没报错，
+        代表不了遥控器认。
 
-        所以按秒表补：只在**没有音频流**的时候补（不打断正在说的话），
-        每次至少隔 every 秒。日志做限流，避免刷屏。
+        正确的 GET_CAPS 会换来一个 CAPS 应答（0x0B，9 字节）。于是它天然就是
+        心跳：
+          · 答了   → 遥控器 ATVV 栈活着，计数清零；
+          · 不答   → 3 秒超时算一次 miss；连续 CAPS_MISS_LIMIT 次 → 判定僵死，
+                     走一次强制重连，并明确告诉用户"这次重连也救不回来的话，
+                     就是遥控器侧卡死（按过静音键），要删设备重配"。
+
+        只在**没有音频流**的时候问，绝不打断正在说的话。
         """
+        miss = 0
         logged = 0.0
         while not self.stop_flag.is_set() and self.connected:
             await asyncio.sleep(2.0)
@@ -1797,23 +1840,55 @@ class VoiceRole(threading.Thread):
                 continue
             if now - getattr(self, "_caps_at", 0.0) < every:
                 continue
-            # 静默超过 60 秒：先 MIC_CLOSE 把"麦克风已打开"这个卡住的状态清掉，
-            # 再补 GET_CAPS 重新进录音态。真机上遥控器闲置后会「连着但一声不响」，
-            # 单发 GET_CAPS 救不回来 —— 它大概认为自己已经开着麦了。
-            if now - last_frame[0] >= 60.0 and \
-                    now - getattr(self, "_mic_reset_at", 0.0) >= 60.0:
-                self._mic_reset_at = now
-                self.atvv_cmd(MIC_CLOSE_CMD)
-                self._log("语音：静默超过 60 秒 —— 先发 MIC_CLOSE 重置录音态，"
-                          "再补 GET_CAPS（遥控器可能以为自己还开着麦）")
-                await asyncio.sleep(0.4)
-                self._rearm_caps(min_gap=0.0, reason="idle")
-                continue
+
+            seen0 = getattr(self, "_caps_seen", 0)
             self._rearm_caps(min_gap=every, reason="idle")
-            if now - logged >= 300.0:
-                logged = now
-                self._log(f"语音：空闲 {idle:.0f} 秒没有音频 —— 补发 GET_CAPS 保活"
-                          f"（真机实测：不补它，放一会儿再按语音键就没反应）")
+            await asyncio.sleep(CAPS_TIMEOUT_S)
+            if not self.connected or self.stop_flag.is_set():
+                break
+
+            if getattr(self, "_caps_seen", 0) > seen0:
+                if miss:
+                    self._log(f"语音：探活恢复 —— 遥控器又开始回能力应答了")
+                miss = 0
+                if now - logged >= 300.0:
+                    logged = now
+                    self._log("语音：空闲保活中（GET_CAPS 有应答，链路健康）")
+                continue
+
+            # 问了不回
+            miss += 1
+            self._log(f"语音：探活失败（第 {miss}/{CAPS_MISS_LIMIT} 次）—— "
+                      f"发了 GET_CAPS，{CAPS_TIMEOUT_S:.0f} 秒内没有能力应答")
+            if miss < CAPS_MISS_LIMIT:
+                # 还不到判定线：先来一发"重锤"（显式关麦 + 再问），有些固件认这个
+                self.atvv_cmd(MIC_CLOSE_CMD)
+                await asyncio.sleep(0.4)
+                seen0 = getattr(self, "_caps_seen", 0)
+                self._rearm_caps(min_gap=0.0, reason="idle")
+                await asyncio.sleep(CAPS_TIMEOUT_S)
+                if getattr(self, "_caps_seen", 0) > seen0:
+                    self._log("语音：MIC_CLOSE 之后重新问到了能力应答 —— 已恢复")
+                    miss = 0
+                continue
+
+            # 连续问不到 → 遥控器的 ATVV 栈僵死了
+            self._log(i18n.L(
+                "语音：连续两次问不到能力应答 —— 遥控器的 ATVV 已经僵死，"
+                "下面自动重连一次试试。若重连后按语音键仍然没反应，就不要再试了："
+                "这是遥控器侧的状态卡死（**按过静音键最容易触发**），"
+                "需要到「设置 → 蓝牙」里**删掉设备重新配对**（先删再配）。",
+                "Voice: two capability probes in a row went unanswered — the remote's "
+                "ATVV stack is wedged. Reconnecting once automatically now. If the voice "
+                "key still does nothing after that, stop retrying: the remote itself is "
+                "stuck (**pressing the mute key is the usual trigger**) and the device has "
+                "to be removed and paired again."))
+            self.note = i18n.L("语音通道僵死（按过静音键？需删设备重配）",
+                               "Voice channel wedged (mute key? re-pair needed)")
+            self._emit("status", {"connected": False, "note": self.note})
+            miss = 0
+            self.force_reconnect()
+            return
 
     async def _silent_watch(self, sessions0, wait=20.0):
         """连上 wait 秒还没收到任何语音数据 → 提示一句，但别把人吓着。
@@ -1943,7 +2018,46 @@ class VoiceRole(threading.Thread):
 
     def _on_status(self, b: bytes):
         active = getattr(self, "_active", False)
-        if b[0] == 0x04 and not active:
+        op = b[0]
+
+        # ── 0x0B：能力应答（CAPS）──────────────────────────────────────
+        # 这是整条链路上**唯一**"你问它就必须答"的东西，所以它是探活心跳：
+        # 收到它就证明遥控器的 ATVV 栈活着；连续几轮问不到，就是僵死了。
+        # 格式（v1.0，9 字节）：0B 01 00 <codecs> <interaction> <frame_size:2> …
+        if op == OP_CAPS:
+            self._caps_miss = 0
+            self._caps_seen = getattr(self, "_caps_seen", 0) + 1
+            self._caps_at = time.time()
+            try:
+                ver = (b[1] << 8) | b[2]
+                codecs = b[3] if len(b) > 3 else 0
+                inter = b[4] if len(b) > 4 else 0
+                frame = ((b[5] << 8) | b[6]) if len(b) > 6 else 0
+                self._caps_info = (ver, codecs, inter, frame)
+                if self._caps_seen == 1:
+                    codec_txt = {0x01: "8kHz PCM", 0x02: "16kHz ADPCM"}.get(
+                        codecs & 0x03, f"0x{codecs:02x}")
+                    self._log(f"语音：能力协商成功 —— 协议 v{ver >> 8}.{ver & 0xFF}，"
+                              f"编码 {codec_txt}，交互 0x{inter:02x}，帧长 {frame}")
+            except Exception:
+                if self._caps_seen == 1:
+                    self._log(f"语音：收到能力应答 {b.hex()}（解析失败，但心跳是通的）")
+            return
+
+        # ── 0x08：遥控器报告"麦克风按键"状态 ────────────────────────────
+        if op == OP_MIC_BUTTON:
+            self._log(f"语音：遥控器报告麦克风按键 {b.hex()}")
+            return
+
+        # ── 0x0A：音频同步包（正常现象，不该刷屏）──────────────────────
+        if op == OP_AUDIO_SYNC:
+            n = getattr(self, "_sync_seen", 0) + 1
+            self._sync_seen = n
+            if n <= 3:
+                self._log(f"语音：音频同步包 {b.hex()}（第 {n} 条，正常）")
+            return
+
+        if op == 0x04 and not active:
             # 上一段"按了却没音频" → 这次按下时先把录音态补回来（见 _rearm_caps）
             prev = getattr(self, "_last_press_frames", None)
             if prev is not None and prev < 20:
