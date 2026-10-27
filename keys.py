@@ -129,10 +129,30 @@ KEY_TO_USAGE = {v: k for k, v in USAGE_TO_KEY.items()}
 # 按 report ID 分开查表，避免和别的蓝牙键鼠（0x02 那套）互相污染。
 # ---------------------------------------------------------------------------
 USAGE_TO_KEY_RC01 = {
+    0x0001: "power",
     0x0003: "up", 0x0004: "down", 0x0005: "left", 0x0006: "right",
-    0x0007: "ok", 0x000A: "home", 0x000B: "back",
+    0x0007: "ok",
+    0x0008: "mute",                     # ★ 静音键：一直在走 HID，之前漏了
+    0x000A: "home", 0x000B: "back",
+    0x000C: "volup", 0x000D: "voldown",
     0x000E: "youtube", 0x000F: "netflix",
+    0x0011: "input",
 }
+# ★ 2026-10-27 补齐 0x01/0x08/0x0C/0x0D/0x11（电源/静音/音量±/输入源）。
+#
+#   原来这张表只有 9 个键，缺的正好是这五个。缺了不会报错 —— `usage_table_for()`
+#   查不到就返回 None，报文被**静默丢掉**，所以表现是"按了没反应，日志一行都没有"，
+#   和"这个键走红外"长得一模一样。之前那句注释
+#   「音量、电源、静音、输入源在这一款上走红外，Windows 收不到」**是错的**，
+#   是我们自己把它们丢了。
+#
+#   怎么确认的：对照另一个同款遥控器的成熟实现（remotemic-src / RC003，
+#   ovb_rc003/remote_layout.py 的 CHROMECAST_REPORT_CODES）：
+#       power=0x01  up=0x03  down=0x04  left=0x05  right=0x06  ok=0x07
+#       volume_mute=0x08  home=0x0A  back=0x0B
+#       volume_up=0x0C  volume_down=0x0D  youtube=0x0E  netflix=0x0F
+#       input_source=0x11
+#   和我们实测到的 0x0003/0x0004/0x0005/0x000B 完全同一套编号，可以确信。
 # 已知的 report ID -> 查表。没列到的按 0x02 那套处理（保持原行为）。
 REPORT_TABLES = {0x01: USAGE_TO_KEY_RC01, 0x02: USAGE_TO_KEY}
 
@@ -1301,11 +1321,14 @@ class KeyTap(threading.Thread):
                 " Press any key on the remote and run the self-check again: still 0 means the HID "
                 "path is not reading (check the Bluetooth link and dependencies first).")
         miss = i18n.L(
-            " ⚠ 如果你刚按了某个键、而上面的列表里没有它，说明这支遥控器根本没发那个键的 HID 报文"
-            " —— 音量、电源、静音、输入源在这一款上走红外，Windows 收不到。",
+            " ⚠ 如果你刚按了某个键、而上面的列表里没有它，说明这支遥控器根本没发那个键的 HID 报文。"
+            "（更正 2026-10-27：音量/电源/静音/输入源**并不是走红外** —— 它们一直在 HID 里，"
+            "只是键码表漏了 0x01/0x08/0x0C/0x0D/0x11 五个，已补齐；现在遇到表里没有的键，"
+            "日志会直接打出原始报文行。）",
             " ⚠ If you just pressed a key and it is missing from the list above, this remote never "
-            "sent that key over HID — volume, power, mute and input-source go over IR on this model, "
-            "so Windows cannot see them.")
+            "sent it over HID. (Correction 2026-10-27: volume/power/mute/input-source do NOT go over "
+            "IR — they were always on HID; the usage table was missing 0x01/0x08/0x0C/0x0D/0x11 and "
+            "that is now fixed. Unmapped keys are logged with their raw report now.)")
         return head + body + tip + miss
 
     def _pid_alive(self, pid):
@@ -1384,6 +1407,23 @@ class KeyTap(threading.Thread):
         self._held.add(hkey)
         kid = table.get(usage)
         if not kid:
+            # ★ 查不到就**静默 return** 是这次踩坑的根源：静音键(0x0008)一直在报文里，
+            #   只是表里没有，于是"按了没反应、日志一行都没有"，看起来和"这个键走红外"
+            #   完全一样，白折腾了一整天。现在每个未知 usage 只记一次原始行，
+            #   一眼就能看出"它发了，是我们不认识"。
+            _unk = getattr(self, "_unknown_logged", None)
+            if _unk is None:
+                _unk = self._unknown_logged = set()
+            if hkey not in _unk and len(_unk) < 12:
+                _unk.add(hkey)
+                self._log(i18n.L(
+                    f"按键映射：收到一个键码表里没有的键 —— report ID 0x{b[0]:02X} / "
+                    f"usage 0x{usage:04X}（原始行 {b.hex(' ')}）。"
+                    f"它没有对应动作，所以不会发任何键；如果这是你想要的键，"
+                    f"把它加进 USAGE_TO_KEY_RC01 就能配。",
+                    f"Key mapping: got an unmapped key — report 0x{b[0]:02X} / "
+                    f"usage 0x{usage:04X} (raw {b.hex(' ')}). No action is bound to it, so "
+                    f"nothing is sent; add it to USAGE_TO_KEY_RC01 to use it."))
             return
         self._emit("key", {"id": kid, "down": True})
         m = self.mapping.get(kid)
