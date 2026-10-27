@@ -76,9 +76,20 @@ UNPAIRED_RETRY_DELAY_S = 8.0
 #     MIC_CLOSE = 0D <session_id>        (2 字节，带回当前会话号)
 #   v0.x 的形态（只有老固件才用，保留兜底）：
 #     MIC_OPEN  = 0C 00 00 / MIC_CLOSE = 0D 00 00
-CAPS_CMD = bytes([0x0A, 0x01, 0x00, 0x00, 0x02, 0x03])
+# ★ 2026-10-27 16:23 真机实测：`0A 01 00 00 03 03` **能换来 CAPS 应答**
+#   （协议 v1.0，编码 16kHz ADPCM，交互 0x03，帧长 240）；而 `0A 01 00 00 02 03`
+#   （remotemic-src 的 chromecast_voice.py 用的那个变体）**没有应答**。
+#   两者的差别在第 5 字节：0x03 vs 0x02（服务能力位）。
+#   atvv_protocol.py 里用的正是 03 03 这个变体 —— 我们抄错了那份。
+CAPS_CMD = bytes([0x0A, 0x01, 0x00, 0x00, 0x03, 0x03])
+CAPS_CMD_ALT = bytes([0x0A, 0x01, 0x00, 0x00, 0x02, 0x03])  # 另一个变体（无应答，留作对照）
+# ★ MIC_CLOSE 必须带**正确的会话号**（`0D <session_id>`，见 atvv_protocol.py 的
+#   mic_close_command）。会话号在遥控器发的 `0x04` 帧里：`04 <reason> <codec> <sid>`。
+#   我们以前永远发 `0D 00` —— 会话号对不上时关麦指令会被忽略，会话就挂着，
+#   这很可能就是"按红外键之后语音永久失效"的机制。
+#   这里留个 2 字节的构造函数，真正用的时候把会话号填进去。
 MIC_OPEN_CMD = bytes([0x0C, 0x00])
-MIC_CLOSE_CMD = bytes([0x0D, 0x00])
+MIC_CLOSE_CMD = bytes([0x0D, 0x00])          # 兜底（会话号未知时）
 MIC_OPEN_CMD_V0 = bytes([0x0C, 0x00, 0x00])
 MIC_CLOSE_CMD_V0 = bytes([0x0D, 0x00, 0x00])
 
@@ -1030,7 +1041,7 @@ class VoiceRole(threading.Thread):
             if self.stop_flag.is_set():
                 return
             if not getattr(self, "_active", False):
-                self.atvv_cmd(MIC_CLOSE_CMD)
+                self.atvv_cmd(self._mic_close_cmd())
 
         try:
             t = threading.Timer(hold, _close_if_idle)
@@ -1067,7 +1078,7 @@ class VoiceRole(threading.Thread):
         sessions0 = self.sessions
         say(i18n.L("语音：开始修复 —— 关麦 → 开麦，等遥控器回话…",
                    "Voice: repairing — closing the mic, then opening it, waiting for the remote…"))
-        self.atvv_cmd(MIC_CLOSE_CMD)
+        self.atvv_cmd(self._mic_close_cmd())
 
         def _step2():
             if self.stop_flag.is_set() or not self.connected:
@@ -1099,6 +1110,41 @@ class VoiceRole(threading.Thread):
         补一发 GET_CAPS 基本就能把录音态叫回来。
         """
         self._rearm_caps(min_gap=0.0, reason="manual")
+
+    def _start_extend_keepalive(self, every=20.0):
+        """录音期间每 20 秒发一次 `0E <sid>`（会话保活）。
+
+        参考实现里这是**内部协议维护**、不做成用户选项（EXTEND_SECONDS = 20.0）：
+        遥控器的录音会话是有寿命的，主机不续命就会过期；而会话一旦过期/挂起，
+        遥控器就再也不接受新的开麦请求 —— 这正是「按红外键之后语音永久失效」
+        最说得通的机制。我们以前从来不发，等于一直在让会话自然过期。
+        """
+        def _loop():
+            while (not self.stop_flag.is_set()
+                    and getattr(self, "_active", False)
+                    and self.connected):
+                time.sleep(every)
+                if not getattr(self, "_active", False) or not self.connected:
+                    return
+                cmd = self._mic_extend_cmd()
+                if cmd:
+                    self.atvv_cmd(cmd)
+        try:
+            t = threading.Thread(target=_loop, daemon=True)
+            t.start()
+        except Exception:
+            pass
+
+    def _mic_close_cmd(self):
+        """关麦命令：带上**遥控器告诉我们的会话号**（对不上会被忽略）。"""
+        sid = getattr(self, "_last_session_id", None)
+        return bytes([0x0D, sid & 0xFF]) if sid is not None else MIC_CLOSE_CMD
+
+    def _mic_extend_cmd(self):
+        """会话保活（`0E <sid>`）：参考实现每 20 秒发一次维持录音会话（EXTEND_SECONDS）。
+        我们以前从来不发 —— 会话可能因此过期，然后遥控器就再也不接受新的开麦请求。"""
+        sid = getattr(self, "_last_session_id", None)
+        return bytes([0x0E, sid & 0xFF]) if sid is not None else None
 
     def atvv_cmd(self, payload):
         """往 ATVV 控制特征写任意命令 —— 给我自己排查用的一把螺丝刀。
@@ -1580,7 +1626,7 @@ class VoiceRole(threading.Thread):
         #   我们以前是反的：直接 disconnect。
         try:
             # ★ 必须在 self._ctl / self._client 还指着旧会话的时候发 —— 发完再清。
-            self.atvv_cmd(MIC_CLOSE_CMD)
+            self.atvv_cmd(self._mic_close_cmd())
             await asyncio.sleep(0.25)
         except Exception:
             pass
@@ -2197,6 +2243,11 @@ class VoiceRole(threading.Thread):
                 self._log(f"语音：音频同步包 {b.hex()}（第 {n} 条，正常）")
             return
 
+        # ★ 0x04 帧的第 4 字节是会话号（`04 <reason> <codec> <sid>`，见
+        #   atvv_session.py 第 209 行）。后面 MIC_CLOSE 和保活都要带它。
+        if op == 0x04 and len(b) >= 4:
+            self._last_session_id = b[3]
+
         if op == 0x04 and not active:
             # 上一段"按了却没音频" → 这次按下时先把录音态补回来（见 _rearm_caps）
             prev = getattr(self, "_last_press_frames", None)
@@ -2208,6 +2259,7 @@ class VoiceRole(threading.Thread):
             #   这是与成熟实现最大的一个行为差异，补上。
             self.atvv_cmd(MIC_OPEN_CMD)
             self._active = True
+            self._start_extend_keepalive()
             self.sessions += 1
             self._session_frames = 0
             self._emit("key", {"id": "voice", "down": True})
@@ -2223,7 +2275,7 @@ class VoiceRole(threading.Thread):
             n = self._session_frames
             self._last_press_frames = n
             # ★ 松开时显式关麦（同样对齐参考实现），下一段按下前状态是干净的。
-            self.atvv_cmd(MIC_CLOSE_CMD)
+            self.atvv_cmd(self._mic_close_cmd())
             self._log(f"语音：▲ 结束（本段 {n} 帧音频 ≈ {n / 62.5:.1f}s）")
             if n < 20:
                 # 按键通了、但遥控器没送音频 —— 这是另一类问题（没真正进录音态），
