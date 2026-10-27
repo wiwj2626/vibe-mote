@@ -42,14 +42,45 @@ async def t_blocked_when_asleep():
 
 
 async def t_pass_after_poke():
-    """按了一下键 → 立刻放行。"""
+    """按了一下键 → 不是立刻放行，而是等加密链路握稳（HID_POST_KEY_SETTLE_S）再放行。
+
+    2026-10-27 真机血泪：按键后**立刻**建链会抢到一条未加密的新链，遥控器只给它
+    5 个基础服务（连 1812 都没有），ATVV 整个消失。同一支遥控器只要晚十几秒连，
+    拿到的就是完整 10 服务、语音连续 8 段全部成功。所以这里断言的是"等了"而不是
+    "秒放"——守的是加密握手的时间窗。
+    """
     v = new_role(True)
     t0 = time.time()
     threading.Timer(0.3, v.poke).start()
-    await asyncio.wait_for(v._wait_hid_awake(), timeout=3.0)
+    await asyncio.wait_for(v._wait_hid_awake(), timeout=8.0)
     dt = time.time() - t0
-    print(f"  [OK] 按键后 {dt:.2f}s 放行（应 ≈0.3s）")
-    assert 0.2 < dt < 1.0, dt
+    print(f"  [OK] 按键后 {dt:.2f}s 放行"
+          f"（应 ≈0.3s + {voice.HID_POST_KEY_SETTLE_S:.1f}s 握手等待）")
+    lo = 0.3 + voice.HID_POST_KEY_SETTLE_S - 0.3
+    hi = 0.3 + voice.HID_POST_KEY_SETTLE_S + 1.5
+    assert lo < dt < hi, f"实测 {dt:.2f}s 不在 {lo:.1f}~{hi:.1f}s 之间"
+
+
+async def t_settle_has_cap():
+    """用户连按方向键、活动时刻被不停刷新 → 也不能无限等（HID_SETTLE_CAP_S 上限）。"""
+    v = new_role(True)
+    stop = threading.Event()
+
+    def spam():
+        while not stop.is_set():
+            v.poke()
+            time.sleep(0.2)
+
+    threading.Thread(target=spam, daemon=True).start()
+    t0 = time.time()
+    try:
+        await asyncio.wait_for(v._wait_hid_awake(), timeout=12.0)
+    finally:
+        stop.set()
+    dt = time.time() - t0
+    print(f"  [OK] 连按不停时 {dt:.2f}s 后仍然放行（上限 "
+          f"{voice.HID_SETTLE_CAP_S:.1f}s，不会被拖死）")
+    assert dt < voice.HID_SETTLE_CAP_S + 2.5, dt
 
 
 async def t_pass_when_no_hid():
@@ -94,7 +125,8 @@ async def main():
     tests = [
         ("HID 在 + 没按键 → 死等", t_blocked_when_asleep),
         ("HID 正在重建 → 死等", t_blocked_while_reconnecting),
-        ("HID 在 + 刚按键 → 放行", t_pass_after_poke),
+        ("HID 在 + 刚按键 → 等握手再放行", t_pass_after_poke),
+        ("连按不停 → 握手等待有上限", t_settle_has_cap),
         ("HID 不在 → 不拦", t_pass_when_no_hid),
         ("窗口过期 → 重新等", t_window_expires),
     ]

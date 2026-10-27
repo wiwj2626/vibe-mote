@@ -36,6 +36,29 @@ ATVV_STATUS = "ab5e0004"
 #   这是语音唯一值得尝试连接的时机 —— 睡得越久越连不上，等没有意义。
 HID_AWAKE_WINDOW_S = 20.0
 
+# ★ 按键之后**必须等这么久**再去建链。这条是 2026-10-27 用三张一样的坏表换来的。
+#
+#   按键的那一刻，Windows 的 HID 子设备正在和遥控器建立**加密**链路。谁先连上，
+#   谁就决定了这条链的加密状态 —— 而遥控器只对已加密的链暴露 00001812(HID) 和
+#   ab5e0001(ATVV)；未加密时只给 1800/1801/180a/180f/1813 这五个。
+#
+#   实测对照（同一支遥控器、同一台机器）：
+#     · 13:16:09 按键 → 中间走了 3 秒连接超时 + 扫广播 + 重连，15 秒后才连上
+#       → 服务表 10 个，含 ab5e0001，随后 8 段语音全部成功（93/98/70/140/112/74/60/61 帧）
+#     · 13:18:42、13:22:34 按键 → 几乎紧接着就发起连接
+#       → 三次都只拿到那 5 个基础服务，ATVV 整个消失
+#
+#   所以「立刻重试」在这里不是优点，是 bug。等它握稳再上。
+HID_POST_KEY_SETTLE_S = 2.5
+
+# 但也不能无限等：用户要是在连按方向键，活动时刻会一直被刷新。
+HID_SETTLE_CAP_S = 6.0
+
+# 只拿到基础服务（说明抢到了一条未加密的新链）之后，别原地立刻再来一次 ——
+# 那会把刚让回去的 HID 又挤掉。退一下，让 Windows 重新握稳。
+UNPAIRED_RETRY_DELAY_S = 8.0
+
+
 # GET_CAPS：让遥控器进录音态并回报能力表。0x0A 命令 / 版本 0x00 / 长度 4 / 负载。
 CAPS_CMD = bytes([0x0A, 0x00, 0x04, 0x00, 0x01])
 
@@ -1052,11 +1075,15 @@ class VoiceRole(threading.Thread):
           · `reconnecting`  —— **一步都不许动**。换电池 / 重新配对之后 Windows 要重建
                                HID 子设备，链路会"连上又断"好几轮；这时插进去建链，
                               会让重建过程无限拉长（蓝牙里看着"连上就断"就是这个）；
-          · `ok`            —— 只在「按键活动后 20 秒内」尝试，其余时间安静等着。
+          · `ok`            —— 只在「按键活动后 20 秒内」尝试，其余时间安静等着；
+                               且按键后还要再等 HID_POST_KEY_SETTLE_S，让 Windows
+                               先把**加密**链路握稳（抢在它前面只会拿到未加密的新链，
+                               那种链上遥控器只给 5 个基础服务，ATVV 整个消失）。
         """
         if self.hid_probe is None:
             return
         waited = 0.0
+        awake_since = None      # 进入"按键醒着"窗口的时刻，配合 HID_SETTLE_CAP_S
         while not self.stop_flag.is_set():
             st = self._hid_gate_state()
             if st == "absent":
@@ -1076,10 +1103,22 @@ class VoiceRole(threading.Thread):
                 waited += 0.5
                 continue
             if time.time() - self._activity_at <= HID_AWAKE_WINDOW_S:
+                # ★ 按键后先等 Windows 把**加密**链路握稳（见 HID_POST_KEY_SETTLE_S）。
+                #   抢在它前面连上去，拿到的是未加密的新链 —— 只有 5 个基础服务，
+                #   连 1812(HID) 都没有，日志是"缺少 ATVV"，看着像遥控器没语音功能。
+                #   上限 HID_SETTLE_CAP_S：用户连按方向键时活动时刻会被一次次刷新，
+                #   没有这个上限就永远等不到。
+                if awake_since is None:
+                    awake_since = time.time()
+                if (time.time() - self._activity_at < HID_POST_KEY_SETTLE_S
+                        and time.time() - awake_since < HID_SETTLE_CAP_S):
+                    await asyncio.sleep(0.2)
+                    continue
                 if waited >= 1.0:
                     self._log(f"语音：系统 HID 已握住链路（等了 {waited:.0f} 秒）"
                               f"—— 开始建语音连接")
                 return
+            awake_since = None
             now = time.time()
             if now - self._gate_logged >= 60.0:
                 self._gate_logged = now
@@ -1420,7 +1459,18 @@ class VoiceRole(threading.Thread):
                 await asyncio.sleep(0.2)
             if self._poke.is_set():
                 self._poke.clear()
-                self._log("语音：遥控器有按键活动 —— 不再退避，立刻重试连接")
+                # ★ 上一次拿到的是"未加密的新链"（只有 5 个基础服务）时不能立刻重来：
+                #   刚让回去的链路还没被 Windows 握稳，再插一次只会又抢到一条新链，
+                #   三张一样的坏表就是这么连着出来的。退一下，给它时间加密。
+                if getattr(self, "_last_unpaired", False):
+                    self._log(f"语音：刚抢到的是未加密链路 —— 先退 {UNPAIRED_RETRY_DELAY_S:.0f} 秒，"
+                              f"等 Windows 把加密链路握稳再试（别急，急着连只会又抢一条新链）")
+                    end2 = time.time() + UNPAIRED_RETRY_DELAY_S
+                    while (time.time() < end2 and not self.stop_flag.is_set()):
+                        await asyncio.sleep(0.2)
+                    self._poke.clear()
+                else:
+                    self._log("语音：遥控器有按键活动 —— 不再退避，立刻重试连接")
 
     async def _device_with_details(self):
         """不靠广播拿到设备对象，塞进 BLEDevice.details。
@@ -1529,6 +1579,7 @@ class VoiceRole(threading.Thread):
         ctl = find(ATVV_CTL)
         if not (audio and status):
             self.misses += 1
+            self._last_unpaired = True      # 供外层退避用：下次别急着立刻重连
             self._log(f"语音：缺少 ATVV 特征（本次枚举到 {len(uuids)} 个服务："
                       f"{', '.join(uuids) or '空'}）")
             # ★ 只在基础服务里转圈 = 这条链路是**我们自己新建**的（不是复用系统 HID 那条）。
@@ -1581,6 +1632,7 @@ class VoiceRole(threading.Thread):
         self.misses = 0
         self._unpaired_hinted = False      # 这次真连上了 → 下次再丢配对要能再提醒
         self._variant_hinted = False
+        self._last_unpaired = False
         self.connected = True
         self.note = i18n.L("已连接", "Connected")
         self._emit("status", {"connected": True, "note": self.note})
