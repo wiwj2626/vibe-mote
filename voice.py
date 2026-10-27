@@ -1831,6 +1831,14 @@ class VoiceRole(threading.Thread):
         """
         miss = 0
         logged = 0.0
+        # ★★ 关键修正（2026-10-27 14:11 血泪）：**这台遥控器根本不回答 GET_CAPS**。
+        #    第一版探活把"问了不回"直接当成僵死，结果在语音完全正常的时候
+        #    （14:11:16 本段 58 帧、14:11:31 本段 74 帧）主动掐断了会话。
+        #    所以必须先确认"这个固件到底会不会答"：
+        #      · 一次都没答过 → 标记 caps_unsupported，**永久关闭僵死判定**，
+        #        只保留一条说明性日志，绝不再自动重连；
+        #      · 答过一次     → 之后"问了不回"才算真的僵死（可信）。
+        #    判据用"本会话有没有收到过 0x0B"，而不是"这次有没有收到"。
         while not self.stop_flag.is_set() and self.connected:
             await asyncio.sleep(2.0)
             if not self.connected:
@@ -1856,7 +1864,16 @@ class VoiceRole(threading.Thread):
                     self._log("语音：空闲保活中（GET_CAPS 有应答，链路健康）")
                 continue
 
-            # 问了不回
+            # 问了不回。先看这个固件到底会不会答 —— 一次都没答过就不许判僵死。
+            if getattr(self, "_caps_supported", None) is not True:
+                if getattr(self, "_caps_supported", None) is None:
+                    self._caps_supported = False
+                    self._log("语音：这台遥控器不回答 GET_CAPS（能力协商不支持）—— "
+                              "已关闭「问不到就当僵死」的判定，避免把正常的会话误杀；"
+                              "健康判据改用「有没有收到 0x04 / 音频」。")
+                miss = 0
+                continue
+
             miss += 1
             self._log(f"语音：探活失败（第 {miss}/{CAPS_MISS_LIMIT} 次）—— "
                       f"发了 GET_CAPS，{CAPS_TIMEOUT_S:.0f} 秒内没有能力应答")
@@ -2026,6 +2043,7 @@ class VoiceRole(threading.Thread):
         # 格式（v1.0，9 字节）：0B 01 00 <codecs> <interaction> <frame_size:2> …
         if op == OP_CAPS:
             self._caps_miss = 0
+            self._caps_supported = True     # 答过一次 = 这个固件支持能力协商
             self._caps_seen = getattr(self, "_caps_seen", 0) + 1
             self._caps_at = time.time()
             try:

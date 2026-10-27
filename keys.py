@@ -986,6 +986,13 @@ class KeyTap(threading.Thread):
                 self.starting = False
                 return False
 
+        # ★ 把每个集合是什么打出来：静音键如果落在另一个集合里，一眼就能看出来
+        #   我们到底开了几个、各自是什么 usage page。
+        try:
+            pages_txt = "、".join(f"page0x{pg:04X}/报告{ln}B" for pg, _, ln in cols)
+            self._log(f"按键映射：已打开的 HID 集合 —— {pages_txt}")
+        except Exception:
+            pass
         self._log(f"按键映射：本地 HID 直读（{len(cols)} 个集合，"
                   f"VID_{vid:04X}&PID_{pid:04X}，不经 frida、不需要提权）")
         self.note = i18n.L("运行中（本地 HID 直读）", "Running (local HID)")

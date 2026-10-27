@@ -96,12 +96,17 @@ setupapi.SetupDiDestroyDeviceInfoList.argtypes = [ctypes.c_void_p]
 PAGE_CONSUMER = 0x0C
 
 
-def open_collections(vid=0x18D1, pid=0x9450, pages=(PAGE_CONSUMER,)):
+def open_collections(vid=0x18D1, pid=0x9450, pages=None):
     """枚举这台遥控器的 HID 集合，返回 [(usage_page, handle, report_len)]。
 
-    一次最多只要每个 usage page 一个句柄（Consumer 一个就够，厂商自定义那个用不上）。
+    ★ 2026-10-27 改：默认 `pages=None` = **打开所有 usage page**。
+      原来只开 Consumer(0x0C)，把厂商自定义那个集合（COL02）整个丢了 ——
+      而静音键在这个遥控器上就是「按了没有任何报文被解析」，最可能就是落在
+      另一个集合里。只开一个集合等于自己把眼睛蒙上一半。
+
+    每个 usage page 只要一个句柄（同一个 page 的重复集合没有必要各开一个）。
     """
-    pages = set(pages)
+    pages = None if pages is None else set(pages)
     found = []
     hidset = setupapi.SetupDiGetClassDevsW(ctypes.byref(HID_GUID), None, None, 0x12)  # PRESENT|DEVICEINTERFACE
     if hidset == INVALID_HANDLE or hidset is None:
@@ -145,7 +150,8 @@ def open_collections(vid=0x18D1, pid=0x9450, pages=(PAGE_CONSUMER,)):
             caps = HIDP_CAPS()
             hid.HidP_GetCaps(preparsed, ctypes.byref(caps))
             hid.HidD_FreePreparsedData(preparsed)
-            if caps.UsagePage in pages and caps.UsagePage not in [p for p, _, _ in found]:
+            if (pages is None or caps.UsagePage in pages) \
+                    and caps.UsagePage not in [p for p, _, _ in found]:
                 found.append((caps.UsagePage, handle, caps.InputReportByteLength))
             else:
                 kernel32.CloseHandle(ctypes.c_void_p(handle))
