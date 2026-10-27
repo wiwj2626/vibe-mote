@@ -1013,9 +1013,17 @@ class VoiceRole(threading.Thread):
             return False
         return True
 
+    # 这些特征的通知是**已知无害**的例行广播，记下来只是刷屏：
+    #   00002a19 电量（每几十秒一次，值不变，约 0x5f）
+    #   00002a05 服务变更、00002a31 扫描刷新（通常还是 Access Denied，订不上）
+    # 把它们排除掉，`其他通知` 剩下的才是真正值得看的"未知报文"。
+    _EXTRA_QUIET = ("00002a19", "00002a05", "00002a31")
+
     def _watch_extra(self, client, ch):
         """把一条"其它" notify 特征的来包记下来（每条最多 5 条）。"""
         uuid = str(ch.uuid).lower()[:8]
+        if uuid in self._EXTRA_QUIET:
+            return
 
         def on_val(_c, data, _uuid=uuid):
             n = self._extra.get(_uuid, 0)
