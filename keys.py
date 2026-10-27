@@ -142,35 +142,33 @@ USAGE_TO_KEY_RC01 = {
 # ★ 2026-10-27 补齐 0x01/0x08/0x0C/0x0D/0x11（电源/静音/音量±/输入源）。
 #
 #   原来这张表只有 9 个键，缺的正好是这五个。缺了不会报错 —— `usage_table_for()`
-#   查不到就返回 None，报文被**静默丢掉**，所以表现是"按了没反应，日志一行都没有"，
-#   和"这个键走红外"长得一模一样。之前那句注释
-#   「音量、电源、静音、输入源在这一款上走红外，Windows 收不到」**是错的**，
-#   是我们自己把它们丢了。
+#   查不到就返回 None，报文被**静默丢掉**，所以表现是"按了没反应，日志一行都没有"。
+#   这条链路本身是对的（编号与同款遥控器的成熟实现完全一致，见下）。
 #
-#   怎么确认的：对照另一个同款遥控器的成熟实现（remotemic-src / RC003，
-#   ovb_rc003/remote_layout.py 的 CHROMECAST_REPORT_CODES）：
+#   编号来源（同一个 VID/PID/REV `Dev_VID&0118D1_PID&9450_REV&0110` 的另一支遥控器，
+#   remotemic-src / RC003 的 ovb_rc003/remote_layout.py → CHROMECAST_REPORT_CODES）：
 #       power=0x01  up=0x03  down=0x04  left=0x05  right=0x06  ok=0x07
 #       volume_mute=0x08  home=0x0A  back=0x0B
 #       volume_up=0x0C  volume_down=0x0D  youtube=0x0E  netflix=0x0F
 #       input_source=0x11
-#   和我们实测到的 0x0003/0x0004/0x0005/0x000B 完全同一套编号，可以确信。
+#   和我们实测到的 0x03/0x04/0x05/0x0B 完全同一套编号。
 #
-# ⚠ 但要诚实说明：**静音键(0x0008) 在本机实测是按了也不发报文的**
-#   （14:16、14:24 两次实测，Consumer 集合与厂商集合 page0xFF01 都是零报文；
-#    后来用 BTHPORT ETW 从 HCI/ACL 层全链路抓包，同样一个字节都没有）。
-#   同族的 0x0001/0x000C/0x000D/0x0011（电源/音量±/输入源）也一样。
+# ⚠⚠ 但**本机这支固件（固件=26.5）实测按这几个键，遥控器一个字节都不发** ——
+#   三重验证（2026-10-27 全天）：
+#   1. HID 直读 150 秒原始报文（不过滤任何长度）：page0x000C 只收到上键 `01 03 00`
+#      和空闲帧 `01 00 00`，page0xFF01（21 字节厂商集合）**零报文**；
+#      按静音 / 音量± / 输入源毫无反应。
+#   2. BTHPORT ETW 事件 402 从 HCI/ACL 空口层抓包（100 秒，链路运行中）：
+#      遥控器那条连接上只有服务发现、ATVV 控制 `1b 61 00 00 02`、固件串，没有按键报告。
+#      （`BIP_DataLen` 与实际导出长度 100% 吻合，排除"抓包被截断"这个可能。）
+#   3. 参考项目那只同标识遥控器能在 ATT 0x0029 上收到 8 字节按键报告（静音=08），
+#      说明**不是协议/键码的问题，是固件行为不同**。
 #
-# ★★ 2026-10-27 定论（对照 remotemic-src / RC003 之后推翻了"这款天生走红外"的说法）：
-#   键码表**没错**，这五个键本来就在蓝牙 HID 报文里 —— 同一个 VID/PID/REV
-#   （Dev_VID&0118D1_PID&9450_REV&0110）的遥控器，参考项目那份文档里 15 次按下
-#   全部收到了，静音就是 0x08。
-#   差别不在固件型号，而在**这支遥控器的红外配置**：
-#     · 遥控器里存着一份"电视红外码"（Google TV 首次配对时选电视品牌写入的）；
-#     · 配了 → 电源/音量/静音/输入源改走红外，电脑收不到，而且一按就把 ATVV
-#       录音通道挂死（这就是"按完语音全废"的真凶）；
-#     · 没配 / 恢复出厂清掉 → 它们回到蓝牙，就是上面这五个键码，既能映射也不挂死语音。
-#   所以这几项不是"永远收不到"，是"这支遥控器当前被配置成红外"。
-#   给遥控器恢复出厂设置之后，这张表无需任何改动就能直接用。
+# ★ 曾经写过"恢复出厂设置清掉红外配置就能让它们回蓝牙" —— 已被 18:10~18:15 的真机实测
+#   推翻：恢复出厂 + 删设备重配之后，语音连续 10 次会话正常，但按静音语音照样立刻挂死，
+#   这四个键的报文照样零。不要再按那个方向下结论。
+#   ⇒ 在本机这支遥控器上，这五个键码**是备着的、但收不到**；换一支所有键走 BLE 的
+#     遥控器时无需改代码即可生效。
 # 已知的 report ID -> 查表。没列到的按 0x02 那套处理（保持原行为）。
 REPORT_TABLES = {0x01: USAGE_TO_KEY_RC01, 0x02: USAGE_TO_KEY}
 
@@ -1347,13 +1345,15 @@ class KeyTap(threading.Thread):
                 "path is not reading (check the Bluetooth link and dependencies first).")
         miss = i18n.L(
             " ⚠ 如果你刚按了某个键、而上面的列表里没有它，说明这支遥控器根本没发那个键的 HID 报文。"
-            "（更正 2026-10-27：音量/电源/静音/输入源**并不是走红外** —— 它们一直在 HID 里，"
-            "只是键码表漏了 0x01/0x08/0x0C/0x0D/0x11 五个，已补齐；现在遇到表里没有的键，"
-            "日志会直接打出原始报文行。）",
+            "（2026-10-27 实测更正：**音量± / 电源 / 静音 / 输入源 在本机这支固件上"
+            "就是不发报文** —— HID 直读 150 秒 + ETW 空口全链路抓包双重验证。"
+            "键码表里的 0x01/0x08/0x0C/0x0D/0x11 已经备好，换一支所有键都走蓝牙的"
+            "遥控器即可直接生效，无需改代码。）",
             " ⚠ If you just pressed a key and it is missing from the list above, this remote never "
-            "sent it over HID. (Correction 2026-10-27: volume/power/mute/input-source do NOT go over "
-            "IR — they were always on HID; the usage table was missing 0x01/0x08/0x0C/0x0D/0x11 and "
-            "that is now fixed. Unmapped keys are logged with their raw report now.)")
+            "sent it over HID. (Measured 2026-10-27: volume / power / mute / input-source are "
+            "**never sent** by this firmware — 150 s of raw HID reads plus an ETW over-the-air "
+            "capture both confirm it. The usage table already carries 0x01/0x08/0x0C/0x0D/0x11, "
+            "so a remote whose keys all go over Bluetooth works with no code change.)")
         return head + body + tip + miss
 
     def _pid_alive(self, pid):
