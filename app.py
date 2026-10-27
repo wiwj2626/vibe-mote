@@ -2883,6 +2883,51 @@ class Handler(BaseHTTPRequestHandler):
                                "optimization (this is the last UAC prompt)…"))
                 threading.Thread(target=follow_elevate_log, daemon=True).start()
             return self._json({"ok": ok, "msg": msg})
+        if act == "voice-cmd":
+            # 直接往 ATVV 控制特征写一条命令（十六进制），排查/救急用。
+            # 例：{"action":"voice-cmd","hex":"0D 00 00"}  → MIC_CLOSE
+            #     {"action":"voice-cmd","hex":"0C 00 00"}  → MIC_OPEN
+            v = ROLES.voice if ROLES else None
+            if v is None or not getattr(v, "connected", False):
+                return self._json({"ok": False, "msg": i18n.L(
+                    "语音没连上，发不了命令", "Voice is not connected")})
+            raw = str((body or {}).get("hex") or "").replace(",", " ").split()
+            try:
+                data = bytes(int(x, 16) for x in raw)
+            except Exception:
+                return self._json({"ok": False, "msg": "hex 格式不对，例如 0D 00 00"})
+            if not data or len(data) > 20:
+                return self._json({"ok": False, "msg": "hex 长度不对（1~20 字节）"})
+            ok = v.atvv_cmd(data)
+            return self._json({"ok": bool(ok), "msg": i18n.L(
+                f"已发送 {data.hex(' ')}", f"Sent {data.hex(' ')}")})
+        if act == "voice-reconnect":
+            # 丢掉会话立刻重连（不重启客户端、不动 HID）。
+            # 用在哪：会话显示"已连接"、按语音键却什么都收不到 —— 重连重走一遍订阅，
+            # 等于给这条链路换一份干净状态，比重启客户端轻得多。
+            v = ROLES.voice if ROLES else None
+            if v is None:
+                return self._json({"ok": False, "msg": i18n.L(
+                    "语音角色没在跑", "Voice role is not running")})
+            ok = v.force_reconnect()
+            return self._json({"ok": bool(ok), "msg": i18n.L(
+                "已丢掉当前会话，正在重连（约 20 秒）" if ok else "重连没发起 —— 当前没有会话",
+                "Dropped the session, reconnecting (~20 s)" if ok
+                else "Nothing to reconnect — no active session")})
+        if act == "voice-rearm":
+            # 「重新激活语音」：补发一次 GET_CAPS。
+            # 为什么需要这个按钮/接口：真机上踩过两次 —— 会话一直连着（connected: True），
+            # 但遥控器的"麦克风录音态"自己过期了，按语音键连 0x04 都不发。
+            # 这时**不要**重启客户端、更不要重新配对（都会打断 HID 链路），补一发就回来。
+            v = ROLES.voice if ROLES else None
+            if v is None or not getattr(v, "connected", False):
+                return self._json({"ok": False, "msg": i18n.L(
+                    "语音角色没连上 —— 先按一下遥控器任意键让它连接，再点这个",
+                    "Voice is not connected — press any remote button first")})
+            v.rearm()
+            return self._json({"ok": True, "msg": i18n.L(
+                "已补发 GET_CAPS —— 现在按住语音键试试",
+                "GET_CAPS re-sent — hold the voice key now")})
         if act == "mic-selfcheck":
             # 「麦克风自检」：读一秒系统默认输入设备，报峰值。用来分清"系统就没声音"
             # 和"程序没读到"（用户报"所有麦克风电平都是 0"时第一件要做的事）。

@@ -39,6 +39,14 @@ HID_AWAKE_WINDOW_S = 20.0
 # GET_CAPS：让遥控器进录音态并回报能力表。0x0A 命令 / 版本 0x00 / 长度 4 / 负载。
 CAPS_CMD = bytes([0x0A, 0x00, 0x04, 0x00, 0x01])
 
+# ATVV 的另外两条命令（上游从没发过）。
+# 为什么值得试：真机上遥控器闲置一会儿后会「连着但一声不响」—— 既不发 0x04
+# 也不送音频，而 GET_CAPS 补发也救不回来。最像的解释是它把"麦克风已打开"这个
+# 状态卡住了：既然它认为已经开着，就再也不会重新开。显式关一次（MIC_CLOSE）
+# 再打开，可能就把它从这个状态里拽出来。
+MIC_OPEN_CMD = bytes([0x0C, 0x00, 0x00])
+MIC_CLOSE_CMD = bytes([0x0D, 0x00, 0x00])
+
 
 def describe_services(client):
     """把服务表压成一行：`ab5e0001[ab5e0002:w,ab5e0003:n,ab5e0004:n] …`
@@ -888,8 +896,10 @@ class VoiceRole(threading.Thread):
         self._caps_at = 0.0                 # 上次发 GET_CAPS 的时间（限流）
         self._last_press_frames = None      # 上一段按住收到的音频帧数
         self._ctrl_seen = 0                 # 控制特征回话条数（诊断用）
+        self._extra = {}                    # 其他 notify 特征各收到几条（诊断用）
         self._ctl_resp = False              # GET_CAPS 该用带响应写还是无响应写
         self._awake_at = 0.0                # 本次会话建立时刻
+        self._mic_reset_at = 0.0            # 上次发 MIC_CLOSE 的时间（限流）
 
     # ---------- 对外 ----------
     def poke(self):
@@ -903,6 +913,107 @@ class VoiceRole(threading.Thread):
         """
         self._activity_at = time.time()
         self._poke.set()
+        # ★ 遥控器刚发过 HID 报文 = 它**确认醒着**，顺手把录音态补一次。
+        #   真机上「放一会儿再按语音键没反应」就是录音态过期 —— 而那种时候遥控器
+        #   连 0x04 都不发，只能由我们主动补（否则要等保活秒表走到）。
+        #   限流 10 秒一次：HID 报文可能一秒钟来几十条，不能每条都写特征。
+        if self.connected and time.time() - getattr(self, "_wake_rearm_at", 0.0) >= 10.0:
+            loop = getattr(self, "_loop", None)
+            if loop is not None:
+                self._wake_rearm_at = time.time()
+                try:
+                    loop.call_soon_threadsafe(
+                        lambda: self._rearm_caps(min_gap=10.0, reason="wake"))
+                except Exception:
+                    pass
+
+    def rearm(self):
+        """手动补发 GET_CAPS —— 给界面/接口留的"一键救急"。
+
+        什么时候用：语音键按了没反应，但日志里会话还在（`connected: True`）。
+        这时不用重启客户端、也不用重新配对（那些动作都会打断 HID 链路），
+        补一发 GET_CAPS 基本就能把录音态叫回来。
+        """
+        self._rearm_caps(min_gap=0.0, reason="manual")
+
+    def atvv_cmd(self, payload):
+        """往 ATVV 控制特征写任意命令 —— 给我自己排查用的一把螺丝刀。
+
+        真机排障时最缺的就是"能不能直接发一条命令看看"：每次都改代码、重启客户端，
+        一次调试要等两三分钟。有了这个，一条 HTTP 就能试 `0D 00 00`（MIC_CLOSE）、
+        `0C 00 00`（MIC_OPEN）、`0A 00 04 00 01`（GET_CAPS）。
+        """
+        ctl = getattr(self, "_ctl", None)
+        client = self._client
+        loop = getattr(self, "_loop", None)
+        if ctl is None or client is None or loop is None:
+            return False
+        data = bytes(payload)
+
+        async def _do():
+            try:
+                await client.write_gatt_char(
+                    ctl, data, response=bool(getattr(self, "_ctl_resp", False)))
+                self._log(f"语音：已发送 ATVV 命令 {data.hex(' ')}")
+            except Exception as e:
+                self._log(f"语音：ATVV 命令 {data.hex(' ')} 发送失败 "
+                          f"{type(e).__name__}: {e}")
+
+        try:
+            loop.call_soon_threadsafe(lambda: asyncio.ensure_future(_do()))
+        except Exception:
+            return False
+        return True
+
+    def force_reconnect(self):
+        """丢掉当前会话、立刻重连 —— 不重启客户端、不动 HID。
+
+        什么时候用：会话显示"已连接"，但按语音键什么都收不到（录音态/订阅已经
+        僵了）。重连会重新走一遍订阅，等于给这条链路换一份干净的状态。
+        """
+        c = self._client
+        loop = getattr(self, "_loop", None)
+        if c is None or loop is None:
+            return False
+        self._activity_at = time.time()
+        self._poke.set()
+
+        async def _do():
+            try:
+                await c.disconnect()
+            except Exception:
+                pass
+
+        try:
+            loop.call_soon_threadsafe(lambda: asyncio.ensure_future(_do()))
+        except Exception:
+            return False
+        return True
+
+    def _watch_extra(self, client, ch):
+        """把一条"其它" notify 特征的来包记下来（每条最多 5 条）。"""
+        uuid = str(ch.uuid).lower()[:8]
+
+        def on_val(_c, data, _uuid=uuid):
+            n = self._extra.get(_uuid, 0)
+            if n >= 5:
+                return
+            self._extra[_uuid] = n + 1
+            loop = getattr(self, "_loop", None)
+            msg = f"语音：其他通知 {_uuid} = {bytes(data).hex(' ')}"
+            if loop is not None:
+                try:
+                    loop.call_soon_threadsafe(self._log, msg)
+                except Exception:
+                    pass
+
+        asyncio.ensure_future(self._safe_sub(client, ch, on_val, uuid))
+
+    async def _safe_sub(self, client, ch, fn, uuid):
+        try:
+            await client.start_notify(ch, fn)
+        except Exception as e:
+            self._log(f"语音：订阅 {uuid} 失败（{type(e).__name__}: {e}）")
 
     def _hid_gate_state(self):
         """把 `hid_probe()` 归一成三态：`ok` / `reconnecting` / `absent`。
@@ -1504,6 +1615,20 @@ class VoiceRole(threading.Thread):
         await client.start_notify(audio, on_audio)
         await client.start_notify(status, on_status)
 
+        # ★ 全通道监听：把这支遥控器**所有**能 notify/indicate 的特征都订上
+        #   （ATVV 那三条除外），每条只记前 5 条。
+        #   排查「按语音键却什么都收不到」时，这一层回答一个关键问题：
+        #   **遥控器到底有没有发东西？发在哪个通道上？** 没有这一层，只能在
+        #   "是不是订阅错了"里打转。
+        for _s in client.services:
+            for _c in _s.characteristics:
+                _props = list(getattr(_c, "properties", []) or [])
+                if not ("notify" in _props or "indicate" in _props):
+                    continue
+                if _c is audio or _c is status or _c is ctl:
+                    continue
+                self._watch_extra(client, _c)
+
         # 探针一：读一次电量。能读出来就证明这条链路是**双向通的** ——
         # 「连上了却没声音」时，先排除"其实链路是死的"这一种。
         self._log("语音：链路自检 —— " + await self._probe_link(client))
@@ -1533,6 +1658,7 @@ class VoiceRole(threading.Thread):
             self._log(f"语音：✗ 认不出语音键目标 {self.voice_spec} —— 语音键不会发任何键")
         self._log("语音：就绪 —— 按住遥控器【语音键】说话，松开即停")
         silent = asyncio.ensure_future(self._silent_watch(self.sessions))
+        keepalive = asyncio.ensure_future(self._caps_keepalive(last_frame))
 
         disc = asyncio.Event()
 
@@ -1556,7 +1682,47 @@ class VoiceRole(threading.Thread):
             self.note = i18n.L("已断开", "Disconnected")
             self.voice.release()
             silent.cancel()
+            keepalive.cancel()
             await self._close_current()
+
+    async def _caps_keepalive(self, last_frame, every=20.0, idle=20.0):
+        """空闲保活：会话还在、但已经 idle 秒没有音频 → 补发一次 GET_CAPS。
+
+        真机现象（同一天复现两次）：连上之后连着用了几次都正常，搁几分钟不动，
+        再按语音键就一声不响 —— 但**会话没断**（`connected` 一直是 True），
+        遥控器连 `0x04` 都不发。说明它那个"麦克风录音态"会自己过期，
+        而 `GET_CAPS` 是唯一能把它叫回来的命令（上游只在建链时发过一次）。
+
+        所以按秒表补：只在**没有音频流**的时候补（不打断正在说的话），
+        每次至少隔 every 秒。日志做限流，避免刷屏。
+        """
+        logged = 0.0
+        while not self.stop_flag.is_set() and self.connected:
+            await asyncio.sleep(2.0)
+            if not self.connected:
+                break
+            now = time.time()
+            if now - last_frame[0] < idle:
+                continue
+            if now - getattr(self, "_caps_at", 0.0) < every:
+                continue
+            # 静默超过 60 秒：先 MIC_CLOSE 把"麦克风已打开"这个卡住的状态清掉，
+            # 再补 GET_CAPS 重新进录音态。真机上遥控器闲置后会「连着但一声不响」，
+            # 单发 GET_CAPS 救不回来 —— 它大概认为自己已经开着麦了。
+            if now - last_frame[0] >= 60.0 and \
+                    now - getattr(self, "_mic_reset_at", 0.0) >= 60.0:
+                self._mic_reset_at = now
+                self.atvv_cmd(MIC_CLOSE_CMD)
+                self._log("语音：静默超过 60 秒 —— 先发 MIC_CLOSE 重置录音态，"
+                          "再补 GET_CAPS（遥控器可能以为自己还开着麦）")
+                await asyncio.sleep(0.4)
+                self._rearm_caps(min_gap=0.0, reason="idle")
+                continue
+            self._rearm_caps(min_gap=every, reason="idle")
+            if now - logged >= 300.0:
+                logged = now
+                self._log(f"语音：空闲 {idle:.0f} 秒没有音频 —— 补发 GET_CAPS 保活"
+                          f"（真机实测：不补它，放一会儿再按语音键就没反应）")
 
     async def _silent_watch(self, sessions0, wait=20.0):
         """连上 wait 秒还没收到任何语音数据 → 提示一句，但别把人吓着。
@@ -1610,7 +1776,7 @@ class VoiceRole(threading.Thread):
                 bits.append(f"{label}=" + raw.decode("utf-8", "replace").strip("\x00")[:24])
         return "，".join(bits) if bits else "读不到任何只读特征（链路可能半死）"
 
-    def _rearm_caps(self, delays=(0.0, 0.30)):
+    def _rearm_caps(self, delays=(0.0, 0.30), min_gap=1.0, reason="starved"):
         """补发 GET_CAPS —— 让遥控器重新进录音态。
 
         为什么需要：GET_CAPS 只在**建链时**发一次，而遥控器会在两次按语音键之间
@@ -1626,7 +1792,7 @@ class VoiceRole(threading.Thread):
         client = self._client
         if ctl is None or loop is None or client is None:
             return
-        if time.time() - getattr(self, "_caps_at", 0.0) < 1.0:
+        if time.time() - getattr(self, "_caps_at", 0.0) < min_gap:
             return                        # 刚发过，别重复刷
         self._caps_at = time.time()
 
@@ -1639,7 +1805,9 @@ class VoiceRole(threading.Thread):
                 try:
                     await client.write_gatt_char(
                         ctl, CAPS_CMD, response=bool(getattr(self, "_ctl_resp", False)))
-                    if i == 0:
+                    if i == 0 and reason == "manual":
+                        self._log("语音：手动补发 GET_CAPS（重新激活录音态）")
+                    elif i == 0 and reason == "starved":
                         self._log("语音：上一段没收到音频 —— 补发 GET_CAPS"
                                   "（让遥控器重新进录音态）")
                 except Exception as e:
