@@ -1668,6 +1668,7 @@ def run_remote_unpair(on_line, mac="70:4F:10:6D:03:A2"):
     侧救不回来（协商 / 关麦 / 开麦 / 全域会话号扫描 / 重连都试过）。删设备重配是
     唯一确定的恢复手段；这个动作把「设置 → 蓝牙 → 找设备 → 删除」那几步变成一键。
     """
+    import re
     import subprocess
     needle = mac.replace(":", "").replace("-", "").upper()
 
@@ -1683,15 +1684,26 @@ def run_remote_unpair(on_line, mac="70:4F:10:6D:03:A2"):
         except Exception as e:
             return "ERR %r" % (e,)
 
-    # 用 pnputil 自己枚举（不碰 shell），找出所有 InstanceId 里带 MAC 的节点
+    # 用 pnputil 自己枚举（不碰 shell），找出所有 InstanceId 里带 MAC 的节点。
+    #
+    # ★ 2026-10-27 修了一个隐蔽 bug：原来这里匹配的是英文标签 `Instance ID:`。
+    #   中文 Windows 上 pnputil 输出的是**中文「实例 ID:」**，那行判断永远不成立，
+    #   于是按钮点了之后一律报"没找到设备节点"，一键重配等于废的。
+    #   现在改成不看标签语言：只要这一行含有 MAC，就用正则把里面的设备路径抠出来。
     ids = []
+    pat = re.compile(r"[A-Za-z][A-Za-z0-9_]*\\[^\s]+")
     for cls in ("Bluetooth", "HIDClass"):
         out = run(["pnputil", "/enum-devices", "/class", cls])
         for ln in out.splitlines():
-            if "Instance ID:" in ln and needle in ln.upper().replace(":", "").replace("&", ""):
-                iid = ln.split("Instance ID:", 1)[1].strip()
-                if iid and iid not in ids:
-                    ids.append(iid)
+            # 去冒号/与号再比对，避免 MAC 的写法差异（704f106d03a2 vs 70:4F:...）
+            if needle not in ln.upper().replace(":", "").replace("&", ""):
+                continue
+            m = pat.search(ln)
+            if not m:
+                continue
+            iid = m.group(0).strip()
+            if iid and iid not in ids:
+                ids.append(iid)
     if not ids:
         say(i18n.L("没找到这台遥控器的设备节点 —— 可能已经删过了，"
                    "直接按住【返回】+【主页】配对即可",

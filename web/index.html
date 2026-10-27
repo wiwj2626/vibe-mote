@@ -886,9 +886,12 @@ input[type=range]::-moz-range-thumb{width:14px;height:14px;border-radius:50%;bac
             <button class="btn primary" type="button" id="btnSetupElevated" data-i18n="set.optimize">一键优化（弹一次管理员）</button>
             <button class="btn" type="button" id="btnRestartApp" data-i18n="set.restartApp">重启整个客户端</button>
             <button class="btn" type="button" id="btnResetBt" data-i18n="set.resetBt">重置蓝牙电台</button>
+            <button class="btn" type="button" id="btnVoiceRepair" data-i18n="set.voiceRepair">修复语音（关麦→开麦）</button>
+            <button class="btn danger" type="button" id="btnRemoteUnpair" data-i18n="set.unpair">一键重配遥控器（删蓝牙配对）</button>
             <button class="btn" type="button" id="btnKeysCheck" data-i18n="set.keysCheck">按键映射自检</button>
             <button class="btn" type="button" id="btnMicCheck" data-i18n="set.micCheck">麦克风自检</button>
           </div>
+          <div class="hint" data-i18n-html="set.unpairHint"></div>
           <div class="hint" data-i18n-html="set.micCheckHint">「<b>麦克风自检</b>」读一秒<b>系统默认输入设备</b>并报峰值：读数是 0 就说明「系统这边就没有声音进来」（多半是默认录音设备被设成了 <code>CABLE Output</code>、设备被静音、隐私设置没开、或音频驱动卡死）—— 跟本程序无关。</div>
           <div class="hint" data-i18n-html="set.keysCheckHint">「<b>按键映射自检</b>」用法：先连按几下遥控器方向键，再点它 —— 日志里会写明钩子读到几次、报文多长、收到几条，用来分清「挂错了宿主」还是「这支遥控器报文格式不同」。<b>公司电脑上按键映射用不了，通常是杀软/EDR 拦了注入：请 IT 把程序目录加进白名单</b>（语音不受影响）。</div>
           <div class="hint" data-i18n-html="set.keysRiskHtml">⚠ 「安装按键映射依赖」会装入 frida，并往系统的蓝牙 HID 驱动宿主里<b>注入</b>一个模块：需要一次管理员权限，可能被杀软误报/隔离，少数带内核反作弊的游戏可能起不来。<b>只要语音就不要装这一项。</b></div>
@@ -1262,6 +1265,12 @@ input[type=range]::-moz-range-thumb{width:14px;height:14px;border-radius:50%;bac
       'set.optimize': '一键优化（弹一次管理员）',
       'set.restartApp': '重启整个客户端',
       'set.resetBt': '重置蓝牙电台',
+      'set.voiceRepair': '修复语音（关麦→开麦）',
+      'set.unpair': '一键重配遥控器（删蓝牙配对）',
+      'set.unpairHint': '⚠ <b>「一键重配遥控器」会删掉这台电脑上的遥控器蓝牙配对</b>，之后要重新配对。用法：语音彻底僵死、软件侧救不回来时 —— <b>先取出电池</b>，再点这个按钮，然后<b>装回电池重新配对</b>。只取电池装回是不够的（会变成「已配对却连不上」）。',
+      'act.unpairConfirm': '将删除本电脑上「Chromecast Remote」的蓝牙配对，之后需要重新配对。继续？',
+      'act.unpairDone': '已开始删除配对 —— 看下方日志；删完后装回电池重新配对。',
+      'act.voiceRepairDone': '已开始修复 —— 几秒后看日志。',
       'set.resetBtHint': '遥控器「按键有用、但语音连不上」时用一次：BLE 设备只接受一个连接，系统有时会把它攥住不放；这一下等于帮你把蓝牙开关关开一次（要一次管理员，期间蓝牙设备会短暂断开）。',
       'cleanup.title': '清理 / 卸载（逐项勾选）',
       'cleanup.hint1Html': '<strong>默认什么都不勾，勾哪项删哪项</strong>，没勾的一律不动（每一项后面标了"现在在不在／多大"）。 带 🔒 的项需要管理员，会弹一次 UAC。执行顺序固定（先断自启 → 再杀进程 → 再删文件）， 因为不先杀进程就删不掉 .venv（正在运行的 pythonw.exe 被系统锁着； 极端情况下程序会安排到退出后自动删完）。',
@@ -1656,6 +1665,12 @@ input[type=range]::-moz-range-thumb{width:14px;height:14px;border-radius:50%;bac
       'set.optimize': 'One-click optimize (one UAC prompt)',
       'set.restartApp': 'Restart the client',
       'set.resetBt': 'Reset Bluetooth radio',
+      'set.voiceRepair': 'Repair voice (close mic → open mic)',
+      'set.unpair': 'Re-pair remote (delete Bluetooth pairing)',
+      'set.unpairHint': '⚠ <b>“Re-pair remote” deletes this PC\'s Bluetooth pairing for the remote</b>, so you must pair it again. Use it when voice is completely wedged and nothing software-side recovers it: <b>pull the battery first</b>, click this, then <b>put the battery back and pair again</b>. Pulling the battery alone is not enough (it ends up “paired but never connecting”).',
+      'act.unpairConfirm': 'This deletes the “Chromecast Remote” Bluetooth pairing on this PC; you will need to pair again. Continue?',
+      'act.unpairDone': 'Started removing the pairing — watch the log below; then put the battery back and pair again.',
+      'act.voiceRepairDone': 'Repair started — watch the log in a few seconds.',
       'set.resetBtHint': 'Use this when the remote\'s buttons still work but voice cannot connect: a BLE device accepts only one connection and Windows sometimes holds on to it. This toggles the Bluetooth radio for you (one admin prompt; Bluetooth devices drop for a few seconds).',
       'cleanup.title': 'Cleanup / uninstall (tick items individually)',
       'cleanup.hint1Html': '<strong>Nothing is ticked by default — only ticked items are removed</strong>, everything else is left untouched (each item shows whether it still exists and how big it is). Items marked 🔒 need administrator rights and trigger one UAC prompt. The order is fixed (disable autostart → kill the process → delete the files), because .venv cannot be deleted while pythonw.exe is running (Windows keeps those files locked; in the worst case the app schedules the deletion for after it exits).',
@@ -3457,6 +3472,15 @@ input[type=range]::-moz-range-thumb{width:14px;height:14px;border-radius:50%;bac
       if (!confirm(t('act.resetBtConfirm'))) return;
       doAction({ action: 'reset-bt' }, $('#checkBox'), t('act.resetBt'))
         .then(function (r) { if (r && r.ok) toast(r.msg || t('act.resetBt')); });
+    });
+    $('#btnVoiceRepair').addEventListener('click', function () {
+      doAction({ action: 'voice-repair' }, $('#checkBox'), t('set.voiceRepair'))
+        .then(function (r) { if (r && r.ok) toast(r.msg || t('act.voiceRepairDone')); });
+    });
+    $('#btnRemoteUnpair').addEventListener('click', function () {
+      if (!confirm(t('act.unpairConfirm'))) return;
+      doAction({ action: 'remote-unpair' }, $('#checkBox'), t('set.unpair'))
+        .then(function (r) { if (r && r.ok) toast(r.msg || t('act.unpairDone')); });
     });
     $('#btnMicCheck').addEventListener('click', function () {
       doAction({ action: 'mic-selfcheck' }, $('#checkBox'), t('set.micCheck'))
