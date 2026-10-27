@@ -1649,8 +1649,8 @@ class VoiceRole(threading.Thread):
         self._last_unpaired = False
         self._gate_note = ""               # 已连上 → 下次再进守卫要能重新提示
         self.connected = True
-        self.note = i18n.L("已就绪（按了没反应？取电池 10 秒）",
-                           "Ready (no response? pull the battery for 10 s)")
+        self.note = i18n.L("已就绪（按了没反应？见日志里的恢复办法）",
+                           "Ready (no response? see the log for recovery steps)")
         self._emit("status", {"connected": True, "note": self.note})
         if self.sink:
             self.sink.reset()
@@ -1848,15 +1848,19 @@ class VoiceRole(threading.Thread):
             "语音：链路正常，但 3 分钟里一条 ATVV 报文都没有 —— 遥控器的录音通道"
             "多半僵死了。**按过静音键最容易触发**：静音键走红外，Windows 收不到它，"
             "但它会把录音通道挂起。软件侧救不回来（重连 / MIC_CLOSE / MIC_OPEN / "
-            "GET_CAPS 都试过无效），**取出电池等 10 秒装回**即可 —— 配对还在，"
-            "不用删设备重新配对。",
+            "GET_CAPS 都试过无效）。恢复办法：**删掉设备重新配对**（顺序必须是先删"
+            "再配对）。⚠ 不要只取电池 —— 实测只取电池会让 Windows 的 HID 子设备变成"
+            "幽灵设备，蓝牙里变成「已配对但连不上」，反而要多走一遍重配。",
             "Voice: the link is healthy, yet there has been no ATVV traffic for 3 "
             "minutes — the remote's recording channel is most likely wedged. "
             "**Pressing the mute key is the usual trigger**: it goes over IR so Windows "
             "never sees it, but it suspends the recording channel. Nothing on the "
             "software side recovers it (reconnect / MIC_CLOSE / MIC_OPEN / GET_CAPS were "
-            "all tried and failed). **Pull the battery for 10 s and put it back** — the "
-            "pairing survives, no need to unpair."))
+            "all tried and failed). Recover by **removing the device and pairing again** "
+            "(remove first, then pair). Do NOT just pull the battery — measured on this "
+            "machine, a battery pull alone leaves Windows' HID sub-devices as phantom "
+            "nodes: Bluetooth then shows “paired but not connected” and you end up having "
+            "to re-pair anyway."))
         self.note = i18n.L("按语音键没反应？取电池 10 秒即可",
                            "Voice key not responding? Pull the battery for 10 s")
         self._emit("status", {"connected": True, "note": self.note})
